@@ -1,37 +1,27 @@
 """
-rag.py — Qdrant + BGE-M3 + Exo 1.0 RAG 파이프라인
+rag.py — Qdrant + BGE-M3 + LLM Router RAG 파이프라인
 [REPLACED] xai_sdk → openai (OpenAI-compatible)
 [REPLACED] Grok Collections → Qdrant vector search
 [REPLACED] Grok Embeddings → BGE-M3 via Ollama
+[ADDED]    Circuit Breaker + 하이브리드 폴백 (Exo → Grok → Claude)
 """
 import time
 import httpx
-from openai import AsyncOpenAI
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 from config import (
-    EXO_BASE_URL, EXO_API_KEY, LLM_MODEL,
     OLLAMA_BASE_URL, EMBED_MODEL,
     QDRANT_HOST, QDRANT_PORT, QDRANT_API_KEY,
     TOP_K, SYSTEM_GUARDRAIL,
 )
+# LLM은 직접 호출 대신 라우터 경유
+from llm_router import router as llm_router
 
 # ──────────────────────────────────────────────
-# Singleton clients (앱 수명 주기 동안 재사용)
+# Singleton Qdrant client (앱 수명 주기 동안 재사용)
 # ──────────────────────────────────────────────
-_llm_client: AsyncOpenAI | None = None
 _qdrant_client: AsyncQdrantClient | None = None
-
-
-def get_llm_client() -> AsyncOpenAI:
-    global _llm_client
-    if _llm_client is None:
-        _llm_client = AsyncOpenAI(
-            base_url=EXO_BASE_URL,
-            api_key=EXO_API_KEY,
-        )
-    return _llm_client
 
 
 def get_qdrant_client() -> AsyncQdrantClient:
@@ -154,16 +144,15 @@ async def run_rag(
         if parts:
             filter_note = f"\n필터 조건: {', '.join(parts)}"
 
-    # 3. LLM 생성 (Exo / Qwen 2.5 72B)
-    llm = get_llm_client()
+    # 3. LLM 생성 — Circuit Breaker 라우터 경유
+    #    우선순위: Exo(로컬) → Grok(xAI) → Claude(Anthropic)
     system_msg = SYSTEM_GUARDRAIL + filter_note
     user_msg = (
         f"다음은 검색된 문서 컨텍스트입니다:\n\n{context}"
         f"\n\n질문: {query}"
     )
 
-    completion = await llm.chat.completions.create(
-        model=LLM_MODEL,
+    result = await llm_router.complete(
         messages=[
             {"role": "system", "content": system_msg},
             {"role": "user",   "content": user_msg},
@@ -172,9 +161,7 @@ async def run_rag(
         max_tokens=1024,
     )
 
-    answer = (completion.choices[0].message.content or "").strip()
-    if not answer:
-        answer = "제공된 문서 근거로는 확인할 수 없습니다."
+    answer = result["content"].strip() or "제공된 문서 근거로는 확인할 수 없습니다."
 
     citations = [
         {
@@ -185,14 +172,10 @@ async def run_rag(
         for chunk in chunks if chunk.get("source")
     ]
 
-    usage = completion.usage
     return {
         "answer":    answer,
         "citations": citations,
         "latency_ms": int((time.time() - t0) * 1000),
-        "usage": {
-            "prompt_tokens":     getattr(usage, "prompt_tokens", None),
-            "completion_tokens": getattr(usage, "completion_tokens", None),
-            "total_tokens":      getattr(usage, "total_tokens", None),
-        },
+        "provider":  result.get("provider", "unknown"),  # 어떤 LLM이 응답했는지
+        "usage":     result.get("usage", {}),
     }

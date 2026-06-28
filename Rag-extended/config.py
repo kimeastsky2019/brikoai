@@ -64,3 +64,22 @@ SYSTEM_GUARDRAIL = os.getenv(
 # ──────────────────────────────────────────────
 COST_PER_1M_INPUT  = float(os.getenv("COST_PER_1M_INPUT", "0.0"))
 COST_PER_1M_OUTPUT = float(os.getenv("COST_PER_1M_OUTPUT", "0.0"))
+
+# ──────────────────────────────────────────────
+# Hybrid Fallback: Grok (xAI) — Fallback 1
+# ──────────────────────────────────────────────
+XAI_API_KEY = os.getenv("XAI_API_KEY", "")              # 비어있으면 Grok 스킵
+XAI_MODEL   = os.getenv("XAI_MODEL", "grok-3-mini")     # 속도 우선
+
+# ──────────────────────────────────────────────
+# Hybrid Fallback: Claude (Anthropic) — Fallback 2
+# ──────────────────────────────────────────────
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")  # 비어있으면 Claude 스킵
+CLAUDE_MODEL      = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")  # 비용 효율 최우선
+
+# ──────────────────────────────────────────────
+# Circuit Breaker 설정
+# ──────────────────────────────────────────────
+CB_FAILURE_THRESHOLD = int(os.getenv("CB_FAILURE_THRESHOLD", "3"))   # 연속 실패 N회 → OPEN
+CB_TIMEOUT_SEC       = float(os.getenv("CB_TIMEOUT_SEC", "30.0"))    # 응답 제한 시간(초)
+CB_RECOVERY_SEC      = int(os.getenv("CB_RECOVERY_SEC", "60"))       # OPEN 후 재시도 대기(초)

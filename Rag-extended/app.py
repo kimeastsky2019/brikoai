@@ -40,6 +40,7 @@ from config import (
     COST_PER_1M_INPUT, COST_PER_1M_OUTPUT,
     SYSTEM_GUARDRAIL,
 )
+from llm_router import router as llm_router
 from cache import cache_get, cache_set
 from rag import run_rag
 from ingest import ingest_bytes, ensure_collection, collection_name_sanitize
@@ -285,7 +286,7 @@ async def read_users_me(current_user: User = Depends(get_current_user)):
 
 
 # ──────────────────────────────────────────────
-# Health
+# Health — Circuit Breaker 상태 포함
 # ──────────────────────────────────────────────
 @app.get("/health")
 async def health():
@@ -304,11 +305,34 @@ async def health():
     except Exception:
         pass
 
+    # Circuit Breaker 현황
+    cb_status = llm_router.status()
+
     return {
-        "ok": True,
-        "model": LLM_MODEL,
+        "ok":     True,
         "qdrant": "up" if qdrant_ok else "down",
-        "exo": "up" if exo_ok else "unknown",
+        "exo":    "up" if exo_ok else "unknown",
+        "llm":    cb_status,   # active_provider, providers 별 state
+    }
+
+
+# ──────────────────────────────────────────────
+# Circuit Breaker 수동 초기화 (관리자용)
+# ──────────────────────────────────────────────
+class ResetRequest(BaseModel):
+    provider: Optional[str] = None  # None → 전체 초기화
+
+
+@app.post("/admin/circuit-reset")
+async def circuit_reset(
+    body: ResetRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Circuit Breaker 수동 초기화. provider 생략 시 전체 초기화."""
+    llm_router.reset(body.provider)
+    return {
+        "reset": body.provider or "all",
+        "status": llm_router.status(),
     }
 
 
