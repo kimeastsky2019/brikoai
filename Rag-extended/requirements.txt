@@ -1,0 +1,51 @@
+# ──────────────────────────────────────────────
+# RAG_search — Rag-extended requirements
+# Stack: Exo 1.0 + Qdrant + BGE-M3 + CrewAI
+# [REMOVED] xai-sdk (replaced by openai)
+# ──────────────────────────────────────────────
+
+# Web framework
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+
+# Database (SQLModel + async SQLite)
+sqlmodel
+aiosqlite
+
+# Auth
+python-jose[cryptography]
+bcrypt
+passlib[bcrypt]
+
+# HTTP
+httpx
+
+# ──────────────────────────────────────────────
+# AI / Vector
+# ──────────────────────────────────────────────
+
+# LLM client (OpenAI-compatible → Exo 1.0)
+openai>=1.12.0
+
+# Vector DB
+qdrant-client>=1.9.0
+
+# Agent framework
+crewai>=0.28.0
+
+# Document parsing
+PyPDF2>=3.0.0
+python-docx
+
+# ──────────────────────────────────────────────
+# Utils
+# ──────────────────────────────────────────────
+cachetools
+python-dotenv
+
+# Testing
+pytest
+pytest-asyncio
+httpx  # also used for testing
