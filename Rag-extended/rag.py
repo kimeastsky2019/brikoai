@@ -73,13 +73,16 @@ async def search_documents(
         if conditions:
             qdrant_filter = Filter(must=conditions)
 
-    hits = await qdrant.search(
+    # qdrant-client 1.12+ 에서 .search() 가 제거되어 query_points() 를 사용합니다.
+    # 반환 타입도 list 가 아닌 QueryResponse 이므로 .points 로 꺼냅니다.
+    resp = await qdrant.query_points(
         collection_name=collection_name,
-        query_vector=query_vector,
+        query=query_vector,
         limit=top_k,
         query_filter=qdrant_filter,
         with_payload=True,
     )
+    hits = resp.points
 
     return [
         {

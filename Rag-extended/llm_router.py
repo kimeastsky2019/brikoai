@@ -2,9 +2,12 @@
 llm_router.py — Circuit Breaker + 자동 폴백 LLM 라우터
 
 우선순위:
-  1순위 (Primary)   : Exo 1.0 / Qwen 2.5 72B  (로컬 TB5 RDMA 클러스터)
+  1순위 (Primary)   : 로컬 추론 (Ollama / Exo, OpenAI 호환 엔드포인트)
   2순위 (Fallback 1): Grok / xAI API           (속도 우선 클라우드)
-  3순위 (Fallback 2): Claude / Anthropic API   (품질 우선 클라우드)
+  3순위 (Fallback 2): ChatGPT / OpenAI API
+  4순위 (Fallback 3): Claude / Anthropic API   (품질 우선 클라우드)
+
+API 키가 비어 있는 provider 는 자동으로 건너뜁니다.
 
 Circuit Breaker 상태:
   CLOSED    → 정상 동작
@@ -35,8 +38,10 @@ from config import (
     # Exo (Primary)
     EXO_BASE_URL, EXO_API_KEY, LLM_MODEL,
     # Grok (Fallback 1)
-    XAI_API_KEY, XAI_MODEL,
-    # Claude (Fallback 2)
+    XAI_API_KEY, XAI_MODEL, XAI_BASE_URL,
+    # ChatGPT (Fallback 2)
+    OPENAI_API_KEY, OPENAI_MODEL, OPENAI_BASE_URL,
+    # Claude (Fallback 3)
     ANTHROPIC_API_KEY, CLAUDE_MODEL,
     # Circuit Breaker
     CB_FAILURE_THRESHOLD, CB_TIMEOUT_SEC, CB_RECOVERY_SEC,
@@ -178,7 +183,7 @@ class ExoProvider(LLMProvider):
 class GrokProvider(LLMProvider):
     name  = "grok"
     model = XAI_MODEL
-    _XAI_BASE = "https://api.x.ai/v1"
+    _XAI_BASE = XAI_BASE_URL
 
     def __init__(self):
         self.cb = CircuitBreaker(name="grok")
@@ -215,7 +220,49 @@ class GrokProvider(LLMProvider):
 
 
 # ══════════════════════════════════════════════════════════
-# Provider 3: Claude / Anthropic (Fallback 2 — 품질 우선)
+# Provider 3: ChatGPT / OpenAI (Fallback 2)
+# ══════════════════════════════════════════════════════════
+
+class OpenAIProvider(LLMProvider):
+    name  = "openai"
+    model = OPENAI_MODEL
+
+    def __init__(self):
+        self.cb = CircuitBreaker(name="openai")
+        self._client: Optional[AsyncOpenAI] = None
+
+    def _get_client(self) -> AsyncOpenAI:
+        if self._client is None:
+            self._client = AsyncOpenAI(
+                base_url=OPENAI_BASE_URL,
+                api_key=OPENAI_API_KEY,
+            )
+        return self._client
+
+    def is_available(self) -> bool:
+        return bool(OPENAI_API_KEY)
+
+    async def complete(self, messages: list[dict], **kwargs) -> dict:
+        client = self._get_client()
+        resp = await client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            **kwargs,
+        )
+        return {
+            "content":  resp.choices[0].message.content or "",
+            "provider": self.name,
+            "model":    self.model,
+            "usage":    {
+                "prompt_tokens":     getattr(resp.usage, "prompt_tokens", None),
+                "completion_tokens": getattr(resp.usage, "completion_tokens", None),
+                "total_tokens":      getattr(resp.usage, "total_tokens", None),
+            },
+        }
+
+
+# ══════════════════════════════════════════════════════════
+# Provider 4: Claude / Anthropic (Fallback 3 — 품질 우선)
 # ══════════════════════════════════════════════════════════
 
 class ClaudeProvider(LLMProvider):
@@ -288,9 +335,10 @@ class LLMRouter:
 
     def __init__(self):
         self.providers: list[LLMProvider] = [
-            ExoProvider(),    # 1순위: 로컬 클러스터
-            GrokProvider(),   # 2순위: xAI Grok (속도)
-            ClaudeProvider(), # 3순위: Anthropic Claude (품질)
+            ExoProvider(),    # 1순위: 로컬 추론 (Ollama / Exo)
+            GrokProvider(),   # 2순위: xAI Grok   (속도)
+            OpenAIProvider(), # 3순위: OpenAI ChatGPT
+            ClaudeProvider(), # 4순위: Anthropic Claude (품질)
         ]
         # 현재 활성 provider 이름 추적
         self._active_provider: str = "exo"

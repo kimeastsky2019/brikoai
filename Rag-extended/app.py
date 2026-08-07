@@ -11,6 +11,7 @@ app.py — FastAPI 메인 애플리케이션
 - Collection.xai_id 필드 = Qdrant 컬렉션 이름으로 재사용
 - Document.xai_doc_id 필드 = 인제스트 작업 UUID로 재사용
 """
+import asyncio
 import uuid
 import time
 import os
@@ -943,12 +944,15 @@ async def agent_chat(
     try:
         from agents.crew import run_single_agent, run_rag_crew, run_research_crew
 
+        # crew.kickoff() 는 동기 호출이라 실행 중인 이벤트 루프 안에서 직접 부르면
+        # CrewAI 가 거부합니다(1.x). 워커 스레드로 넘겨 실행하면 그 스레드에는
+        # 이벤트 루프가 없어 정상 동작하고, 동시에 API 이벤트 루프도 막히지 않습니다.
         if req.mode == "single":
-            result = run_single_agent(req.query, qdrant_collection)
+            result = await asyncio.to_thread(run_single_agent, req.query, qdrant_collection)
         elif req.mode == "research_crew":
-            result = run_research_crew(req.query, qdrant_collection)
+            result = await asyncio.to_thread(run_research_crew, req.query, qdrant_collection)
         else:  # rag_crew (default)
-            result = run_rag_crew(req.query, qdrant_collection)
+            result = await asyncio.to_thread(run_rag_crew, req.query, qdrant_collection)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"에이전트 실행 실패: {str(e)}")

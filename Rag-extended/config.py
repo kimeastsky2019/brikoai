@@ -72,10 +72,20 @@ XAI_API_KEY = os.getenv("XAI_API_KEY", "")              # 비어있으면 Grok �
 XAI_MODEL   = os.getenv("XAI_MODEL", "grok-3-mini")     # 속도 우선
 
 # ──────────────────────────────────────────────
-# Hybrid Fallback: Claude (Anthropic) — Fallback 2
+# Hybrid Fallback: ChatGPT (OpenAI) — Fallback 2
+# ──────────────────────────────────────────────
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")        # 비어있으면 ChatGPT 스킵
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+
+# ──────────────────────────────────────────────
+# Hybrid Fallback: Claude (Anthropic) — Fallback 3
 # ──────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")  # 비어있으면 Claude 스킵
 CLAUDE_MODEL      = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")  # 비용 효율 최우선
+
+# xAI(Grok) 엔드포인트 — OpenAI 호환
+XAI_BASE_URL = os.getenv("XAI_BASE_URL", "https://api.x.ai/v1")
 
 # ──────────────────────────────────────────────
 # Circuit Breaker 설정

@@ -33,7 +33,8 @@ openai>=1.12.0
 anthropic>=0.28.0
 
 # Vector DB
-qdrant-client>=1.9.0
+# 1.12 에서 .search() 가 제거되고 query_points() 로 대체됨 → rag.py 가 신 API 사용
+qdrant-client>=1.12
 
 # Agent framework
 crewai>=0.28.0

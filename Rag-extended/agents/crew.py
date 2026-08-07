@@ -6,23 +6,71 @@ agents/crew.py — CrewAI 에이전트 크루 정의
 2. run_single_agent() — 단일 에이전트 빠른 답변
 3. run_research_crew() — 3-에이전트 심층 분석 (리서처 + 팩트체커 + 보고서 작성자)
 """
+import logging
+
 from crewai import Agent, Task, Crew, LLM, Process
-from config import EXO_BASE_URL, EXO_API_KEY, LLM_MODEL, AGENT_VERBOSE, AGENT_MAX_ITER
+from config import (
+    EXO_BASE_URL, EXO_API_KEY, LLM_MODEL,
+    XAI_API_KEY, XAI_MODEL, XAI_BASE_URL,
+    OPENAI_API_KEY, OPENAI_MODEL, OPENAI_BASE_URL,
+    AGENT_VERBOSE, AGENT_MAX_ITER,
+)
+from llm_router import router as llm_router
 from agents.tools import (
     rag_search_tool, rag_answer_tool,
     document_analyze_tool, list_collections_tool,
 )
 
+logger = logging.getLogger(__name__)
+
 
 # ──────────────────────────────────────────────
 # LLM 팩토리
 # ──────────────────────────────────────────────
+# CrewAI 는 litellm 을 통해 LLM 을 직접 호출하므로 llm_router.complete() 를
+# 거치지 않습니다. 그래서 폴백이 적용되지 않는 문제가 있었습니다.
+# 대신 라우터가 관리하는 Circuit Breaker 상태를 읽어, 로컬 추론이 죽어 있으면
+# 크루 생성 시점에 클라우드 provider 로 전환합니다.
+#
+# 우선순위는 llm_router 와 동일: 로컬 → Grok → ChatGPT
+# (Claude 는 Anthropic 전용 API 라 OpenAI 호환 경로로 붙지 않아 제외)
+_CREW_CHAIN = [
+    ("exo",    lambda: (LLM_MODEL,    EXO_BASE_URL,    EXO_API_KEY or "local")),
+    ("grok",   lambda: (XAI_MODEL,    XAI_BASE_URL,    XAI_API_KEY)),
+    ("openai", lambda: (OPENAI_MODEL, OPENAI_BASE_URL, OPENAI_API_KEY)),
+]
+
+
+def _pick_provider() -> tuple[str, str, str, str]:
+    """라우터의 Circuit Breaker 상태 기준으로 사용 가능한 provider 선택."""
+    status = llm_router.status()["providers"]
+
+    for name, resolve in _CREW_CHAIN:
+        model, base_url, api_key = resolve()
+        st = status.get(name, {})
+        # 키가 없으면 스킵 (로컬은 키 불필요)
+        if name != "exo" and not api_key:
+            continue
+        # Circuit 이 OPEN 이면 스킵
+        if st.get("state") == "open":
+            logger.warning(f"[Crew] {name} Circuit OPEN — 다음 provider 로 전환")
+            continue
+        return name, model, base_url, api_key
+
+    # 전부 막혀 있으면 로컬로 재시도 (실패는 호출부에서 처리)
+    logger.error("[Crew] 사용 가능한 provider 없음 — 로컬로 재시도")
+    return "exo", LLM_MODEL, EXO_BASE_URL, EXO_API_KEY or "local"
+
+
 def create_llm(temperature: float = 0.1) -> LLM:
-    """Exo 1.0 / Qwen 2.5 72B — OpenAI 호환"""
+    """현재 살아있는 provider 로 CrewAI LLM 생성 (OpenAI 호환 경로)"""
+    name, model, base_url, api_key = _pick_provider()
+    if name != "exo":
+        logger.info(f"[Crew] 폴백 provider 사용: {name} ({model})")
     return LLM(
-        model=f"openai/{LLM_MODEL}",
-        base_url=EXO_BASE_URL,
-        api_key=EXO_API_KEY,
+        model=f"openai/{model}",
+        base_url=base_url,
+        api_key=api_key,
         temperature=temperature,
         max_tokens=1024,
     )
