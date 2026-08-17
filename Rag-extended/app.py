@@ -106,6 +106,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- 지식 데이터베이스 구축 (업종별 온톨로지 · 규제 준수) ------------------
+# 의존성(pdfplumber/openpyxl)이 없으면 본체는 계속 동작한다. 지식DB 화면만 죽는다.
+try:
+    from kb.router import router as kb_router
+    app.include_router(kb_router)
+except Exception as _e:
+    print(f"Warning: knowledge-base router not loaded: {_e}")
+
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 
@@ -149,6 +158,10 @@ class Filters(BaseModel):
     version: str | None = None
     date_from: str | None = None
     date_to: str | None = None
+    # 지식 데이터베이스 축. sector 는 업종(닫힌 집합), channel 은 글/표/그림.
+    # 표만 검색하면 수치 질의의 정확도가 크게 오른다.
+    sector: str | None = None
+    channel: str | None = None
 
 
 class ChatRequest(BaseModel):

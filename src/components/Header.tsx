@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
-import { Search, Upload, BarChart3, Settings, LogIn, LogOut } from "lucide-react";
+import { Search, Upload, BarChart3, Settings, LogIn, LogOut, Database } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { api } from "@/lib/api";
 import { toast } from "sonner";
@@ -60,6 +60,14 @@ const Header = () => {
                         >
                             <Upload className="w-4 h-4 mr-2" />
                             업로드
+                        </Button>
+                        <Button
+                            variant="ghost"
+                            className="text-foreground hover:text-primary"
+                            onClick={() => handleAuthAction(() => navigate("/knowledge-base"))}
+                        >
+                            <Database className="w-4 h-4 mr-2" />
+                            지식 데이터베이스 구축
                         </Button>
                         <Button
                             variant="ghost"

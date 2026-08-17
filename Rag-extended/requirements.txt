@@ -53,3 +53,7 @@ python-dotenv
 pytest
 pytest-asyncio
 httpx  # also used for testing
+
+# 지식 데이터베이스 — 4채널 문서 분해
+pdfplumber
+openpyxl
