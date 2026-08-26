@@ -3,9 +3,15 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.ext.asyncio import create_async_engine
 
-DATABASE_URL = "sqlite+aiosqlite:///./rag.db"
+import os
 
-engine = create_async_engine(DATABASE_URL, echo=True, future=True)
+# 배포 시 WorkingDirectory 밖(예: /opt/sllm/data/rag.db)에 두려면 DATABASE_URL 로 덮어씁니다.
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./rag.db")
+
+# echo=True 는 모든 SQL 을 journal 에 쏟아붓습니다 — 운영에서는 끕니다.
+DB_ECHO = os.getenv("DB_ECHO", "false").lower() == "true"
+
+engine = create_async_engine(DATABASE_URL, echo=DB_ECHO, future=True)
 
 async def init_db():
     async with engine.begin() as conn:

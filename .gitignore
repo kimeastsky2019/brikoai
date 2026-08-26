@@ -21,6 +21,9 @@ build/
 
 # macOS
 .DS_Store
+# 파일 복사 시 macOS 가 붙이는 중복 이름("xxx 2.py").
+# 배포본에 섞이면 구버전이 정본을 가려 ModuleNotFoundError 를 일으킨 적이 있다.
+* [0-9].*
 
 # Logs
 *.log

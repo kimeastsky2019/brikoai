@@ -32,6 +32,10 @@ openai>=1.12.0
 # Hybrid fallback: Claude / Anthropic (Fallback 2, optional)
 anthropic>=0.28.0
 
+# 경량 임베딩 (ONNX/CPU) — 저사양 서버에서 Ollama+BGE-M3 대체
+# EMBED_PROVIDER=ollama 로 두면 설치하지 않아도 됩니다.
+fastembed>=0.4.0
+
 # Vector DB
 # 1.12 에서 .search() 가 제거되고 query_points() 로 대체됨 → rag.py 가 신 API 사용
 qdrant-client>=1.12

@@ -36,7 +36,7 @@ from openai import AsyncOpenAI
 
 from config import (
     # Exo (Primary)
-    EXO_BASE_URL, EXO_API_KEY, LLM_MODEL,
+    EXO_ENABLED, EXO_BASE_URL, EXO_API_KEY, LLM_MODEL,
     # Grok (Fallback 1)
     XAI_API_KEY, XAI_MODEL, XAI_BASE_URL,
     # ChatGPT (Fallback 2)
@@ -155,7 +155,7 @@ class ExoProvider(LLMProvider):
         return self._client
 
     def is_available(self) -> bool:
-        return bool(EXO_BASE_URL)
+        return EXO_ENABLED and bool(EXO_BASE_URL)
 
     async def complete(self, messages: list[dict], **kwargs) -> dict:
         client = self._get_client()
@@ -340,8 +340,8 @@ class LLMRouter:
             OpenAIProvider(), # 3순위: OpenAI ChatGPT
             ClaudeProvider(), # 4순위: Anthropic Claude (품질)
         ]
-        # 현재 활성 provider 이름 추적
-        self._active_provider: str = "exo"
+        # 현재 활성 provider 이름 추적 — 성공 호출 전에는 None(아직 미확정)
+        self._active_provider: Optional[str] = None
 
     async def complete(
         self,
@@ -420,7 +420,9 @@ class LLMRouter:
                 available_providers.append(p.name)
 
         return {
-            "active_provider": self._active_provider,
+            # 아직 성공 호출이 없으면 다음에 시도될 provider 를 보여줍니다.
+            "active_provider": self._active_provider
+                               or (available_providers[0] if available_providers else None),
             "available":       available_providers,
             "providers":       providers_status,
         }

@@ -1,15 +1,86 @@
 # 서버 배포 가이드 — 211.119.38.216
 
+> **이 서버에는 LLMWiki 도 함께 올라가 있다.** GPU·Ollama·nginx 를 공유하므로
+> 서버를 처음 세우거나 통째로 옮길 때는 [`SERVER-INSTALL.md`](SERVER-INSTALL.md)
+> (통합 설치 가이드)를 먼저 본다. 이 문서는 RAG-AI_Gov 하나만 다룬다.
+
 올인원 구성(Qdrant + Ollama + FastAPI + Nginx)을 단일 리눅스 서버에 설치합니다.
 
+**접속 주소: http://211.119.38.216/**
+**도메인: `rag.ets0404.com` — nginx 바인딩 완료, DNS A 레코드 등록 대기 중 (아래 참고)**
+
 ```
-브라우저 ──▶ Nginx :80 ──┬──▶ /          정적 프론트엔드 (dist/)
-                         └──▶ /api/      FastAPI :8000 (127.0.0.1 바인딩)
-                                            ├──▶ Qdrant  :6333  (Docker, 로컬 전용)
-                                            └──▶ Ollama  :11434 (임베딩 bge-m3 + LLM)
+브라우저 ──▶ Nginx :80 / :443 ──┬──▶ /      정적 프론트엔드 (dist/)
+                                └──▶ /api/  FastAPI :8000 (127.0.0.1 바인딩)
+                                              ├──▶ Qdrant  :6333  (Docker, 로컬 전용)
+                                              └──▶ Ollama  :11434 (임베딩 bge-m3 + LLM)
 ```
 
-외부에 열리는 포트는 **80 하나뿐**입니다. Qdrant·Ollama·FastAPI는 모두 `127.0.0.1`에만 바인딩됩니다.
+Qdrant·Ollama·FastAPI는 모두 `127.0.0.1`에만 바인딩되어 외부에 직접 노출되지 않습니다.
+
+## ⚠ 443/tcp 가 상위 네트워크에서 차단되어 있습니다
+
+서버 안에서는 HTTPS가 정상 동작하지만(`curl -sk https://127.0.0.1/` → 200), 외부에서는
+443 연결이 타임아웃됩니다. 서버 측 방화벽 문제가 아닙니다 — `ufw`는 inactive이고 `iptables INPUT`도
+비어 있으며 nginx는 `0.0.0.0:443`을 리슨 중입니다. 즉 **사내망/ISP 등 서버 바깥에서 막고 있습니다.**
+
+그래서 현재 nginx는 80·443 양쪽에 같은 앱을 서빙합니다. **접속은 `http://211.119.38.216/` 로 하세요.**
+
+- **로그인 토큰이 평문으로 오갑니다.** 임시 상태로만 쓰세요.
+- 443이 열리면 [`nginx-rag-ai-gov.conf`](nginx-rag-ai-gov.conf)의 `### HTTPS 전용 전환 ###`
+  주석대로 80을 리다이렉트로 되돌리고 `sudo systemctl reload nginx` 하세요.
+
+## 도메인 — rag.ets0404.com
+
+nginx는 `server_name rag.ets0404.com` + `default_server` 로 설정되어 있어, 도메인·IP 어느 쪽으로
+들어와도 앱이 응답합니다. Host 헤더를 위조해 검증한 결과 서버 측은 이미 준비 완료입니다:
+
+```bash
+curl -H "Host: rag.ets0404.com" http://211.119.38.216/api/health   # → 200
+```
+
+**남은 작업은 DNS 한 줄뿐입니다.** `rag.ets0404.com` 은 현재 권한 네임서버에서 NXDOMAIN 입니다.
+
+| Type | Name | Value | TTL |
+|---|---|---|---|
+| A | `rag` | `211.119.38.216` | 300 |
+
+`ets0404.com` 의 네임서버는 `cns1~4.hostcocoa.com` 이므로 **호스트코코아 DNS 관리 페이지**에서
+위 A 레코드를 추가하세요. 루트 도메인(`ets0404.com`)은 AWS CloudFront(`3.171.185.x`)를 가리키고
+있으니 **건드리지 말고 `rag` 서브도메인만** 추가하면 됩니다.
+
+전파 확인:
+
+```bash
+dig +short @cns1.hostcocoa.com rag.ets0404.com A    # 권한 NS 즉시 반영
+dig +short rag.ets0404.com A                        # 캐시 전파 (TTL 만큼 소요)
+curl -s http://rag.ets0404.com/api/health
+```
+
+### 도메인 연결 후 — Let's Encrypt 인증서
+
+80/tcp 는 외부에 열려 있으므로 DNS만 붙으면 HTTP-01 검증이 통과합니다.
+(443이 아직 막혀 있어 인증서를 발급해도 외부에서 HTTPS 접속은 안 되지만, 미리 받아둘 수는 있습니다.)
+
+```bash
+sudo apt-get install -y certbot
+sudo certbot certonly --webroot -w /var/www/html -d rag.ets0404.com
+# 발급 후 nginx-rag-ai-gov.conf 의 ssl_certificate 두 줄을 letsencrypt 경로로 교체
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+### nginx 설정 구조
+
+80·443 서버 블록이 동일한 앱 설정을 공유하도록 공통부를 snippet으로 분리했습니다.
+
+| 파일 | 서버 배치 위치 |
+|---|---|
+| [`nginx-rag-ai-gov.conf`](nginx-rag-ai-gov.conf) | `/etc/nginx/sites-available/rag-ai-gov.conf` |
+| [`snippets/rag-ai-gov-app.conf`](snippets/rag-ai-gov-app.conf) | `/etc/nginx/snippets/` |
+| [`snippets/rag-ai-gov-security-headers.conf`](snippets/rag-ai-gov-security-headers.conf) | `/etc/nginx/snippets/` |
+
+`add_header`는 하위 블록에서 재정의되면 상속분이 통째로 사라지므로, 보안 헤더는 별도 snippet으로
+빼서 `add_header`를 쓰는 location마다 함께 include합니다.
 
 ---
 
@@ -140,10 +211,12 @@ curl -s -X POST http://211.119.38.216/api/token \
 ## 6. 설치 직후 필수 조치
 
 1. **기본 계정 비밀번호 변경** — `info@gngmeta.com / admin1234`가 코드에 하드코딩되어 최초 기동 시 자동 생성됩니다. 외부 노출 서버라면 즉시 변경하세요.
-2. **HTTPS 적용** — 현재 구성은 HTTP이므로 로그인 토큰이 평문으로 오갑니다. 도메인이 있다면:
+2. **443/tcp 개방 요청** — 위 경고 참고. 서버 바깥에서 막혀 있어 현재 HTTP로만 접속됩니다. 네트워크 담당자에게 443 인바운드 허용을 요청하세요.
+3. **HTTPS 전환** — 443이 열린 뒤, 도메인이 있다면 자체 서명 인증서를 신뢰 인증서로 바꾸세요:
    ```bash
    sudo certbot --nginx -d your-domain.com
    ```
+   그다음 [`nginx-rag-ai-gov.conf`](nginx-rag-ai-gov.conf)에서 80을 HTTPS 리다이렉트로 되돌립니다.
 
 ---
 

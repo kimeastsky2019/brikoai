@@ -270,6 +270,9 @@ fi
 
 # ── 10. Nginx ────────────────────────────────────────────────
 log "Nginx 설정"
+# 서버 블록이 include 하는 공통 snippet 을 먼저 배치해야 nginx -t 가 통과합니다.
+mkdir -p /etc/nginx/snippets
+cp "$SRC_DIR"/deploy/snippets/rag-ai-gov-*.conf /etc/nginx/snippets/
 if [ -d /etc/nginx/sites-available ]; then
   cp "$SRC_DIR/deploy/nginx-rag-ai-gov.conf" /etc/nginx/sites-available/rag-ai-gov.conf
   ln -sf /etc/nginx/sites-available/rag-ai-gov.conf /etc/nginx/sites-enabled/rag-ai-gov.conf
@@ -281,16 +284,18 @@ nginx -t
 systemctl enable nginx
 systemctl reload nginx || systemctl restart nginx
 
-# ── 10-1. 방화벽 (HTTP 개방) ─────────────────────────────────
+# ── 10-1. 방화벽 (HTTP/HTTPS 개방) ───────────────────────────
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
-  log "ufw: 80/tcp 개방"
+  log "ufw: 80/tcp, 443/tcp 개방"
   ufw allow 80/tcp
+  ufw allow 443/tcp
 elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
-  log "firewalld: http 서비스 개방"
+  log "firewalld: http/https 서비스 개방"
   firewall-cmd --permanent --add-service=http
+  firewall-cmd --permanent --add-service=https
   firewall-cmd --reload
 else
-  warn "방화벽 미감지 — 클라우드 보안그룹에서 80/tcp 인바운드를 직접 허용하세요"
+  warn "방화벽 미감지 — 클라우드 보안그룹에서 80/tcp, 443/tcp 인바운드를 직접 허용하세요"
 fi
 
 # ── 11. 헬스체크 ─────────────────────────────────────────────
