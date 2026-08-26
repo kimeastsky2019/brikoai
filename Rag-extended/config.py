@@ -10,16 +10,35 @@ load_dotenv()
 # ──────────────────────────────────────────────
 # LLM: Exo 1.0 (OpenAI-compatible, 로컬 클러스터)
 # ──────────────────────────────────────────────
+# 로컬 추론 노드가 없는 호스트(예: 2GB 클라우드 서버)에서는 EXO_ENABLED=false 로
+# 꺼 둡니다. 켜 두면 라우터가 매번 1순위로 시도했다가 실패하고 폴백하느라
+# 첫 요청이 타임아웃만큼 느려집니다.
+EXO_ENABLED  = os.getenv("EXO_ENABLED", "true").lower() == "true"
 EXO_BASE_URL = os.getenv("EXO_BASE_URL", "http://localhost:52415/v1")
 EXO_API_KEY  = os.getenv("EXO_API_KEY", "local")   # Exo는 키 불필요
 LLM_MODEL    = os.getenv("LLM_MODEL", "qwen2.5:72b")  # 한국어 최적
 
 # ──────────────────────────────────────────────
-# Embedding: BGE-M3 via Ollama (한/영/중 다국어)
+# Embedding
+#   fastembed : ONNX 경량 다국어 모델 (저사양 서버 기본값, 384-dim)
+#   ollama    : BGE-M3 via Ollama   (고사양 호스트, 1024-dim)
+# provider 를 바꾸면 EMBED_DIM 도 함께 바꿔야 합니다 — 컬렉션 생성 시 고정됩니다.
 # ──────────────────────────────────────────────
+EMBED_PROVIDER  = os.getenv("EMBED_PROVIDER", "fastembed").lower()
+
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 EMBED_MODEL     = os.getenv("EMBED_MODEL", "bge-m3")
-EMBED_DIM       = int(os.getenv("EMBED_DIM", "1024"))
+
+# 한국어를 포함한 50여 개 언어를 지원하는 384-dim 모델. ONNX 가중치 약 0.44GB 로
+# 2GB RAM 서버에서도 상주 가능합니다.
+FASTEMBED_MODEL = os.getenv(
+    "FASTEMBED_MODEL",
+    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+)
+FASTEMBED_CACHE_DIR = os.getenv("FASTEMBED_CACHE_DIR", "")
+
+_DEFAULT_EMBED_DIM = "384" if EMBED_PROVIDER == "fastembed" else "1024"
+EMBED_DIM       = int(os.getenv("EMBED_DIM", _DEFAULT_EMBED_DIM))
 
 # ──────────────────────────────────────────────
 # Vector DB: Qdrant (로컬, ARM 네이티브)
@@ -34,6 +53,22 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", None)  # 로컬은 None
 TOP_K          = int(os.getenv("TOP_K", "5"))
 CHUNK_SIZE     = int(os.getenv("CHUNK_SIZE", "512"))    # 문자 단위
 CHUNK_OVERLAP  = int(os.getenv("CHUNK_OVERLAP", "64"))
+
+# 섹션 인지 청킹 — 마크다운/번호 헤딩으로 먼저 자르고, 섹션이 크면 그 안에서만 쪼갠다.
+SECTION_AWARE_CHUNKING = os.getenv("SECTION_AWARE_CHUNKING", "true").lower() == "true"
+
+# 하이브리드 검색 (dense 벡터 + BM25 스파스, RRF 융합)
+HYBRID_SEARCH  = os.getenv("HYBRID_SEARCH", "true").lower() == "true"
+SPARSE_MODEL   = os.getenv("SPARSE_MODEL", "Qdrant/bm25")
+SPARSE_VECTOR_NAME = "bm25"      # Qdrant 내 스파스 벡터 이름 (변경 시 재색인 필요)
+DENSE_VECTOR_NAME  = "dense"     # 신규 컬렉션의 명명 벡터. 구 컬렉션은 무명 벡터.
+RRF_PREFETCH   = int(os.getenv("RRF_PREFETCH", "40"))   # 융합 전 각 경로가 가져올 후보 수
+
+# ──────────────────────────────────────────────
+# 원본 파일 보관소 (데이터 계약 P1)
+# ──────────────────────────────────────────────
+# rag.db 와 같은 백업 단위로 묶여야 대장과 원본의 정합이 유지된다.
+FILES_ROOT     = os.getenv("FILES_ROOT", "/opt/rag/data/files")
 
 # ──────────────────────────────────────────────
 # Cache (in-memory LRU)

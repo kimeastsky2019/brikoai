@@ -35,7 +35,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, OptimizersConfigDiff
 
 from config import (
-    EXO_BASE_URL, EXO_API_KEY, LLM_MODEL,
+    EXO_ENABLED, EXO_BASE_URL, EXO_API_KEY, LLM_MODEL,
     QDRANT_HOST, QDRANT_PORT, QDRANT_API_KEY,
     EMBED_DIM, CACHE_TTL_SEC, CACHE_MAXSIZE,
     COST_PER_1M_INPUT, COST_PER_1M_OUTPUT,
@@ -44,9 +44,15 @@ from config import (
 from llm_router import router as llm_router
 from cache import cache_get, cache_set
 from rag import run_rag
-from ingest import ingest_bytes, ensure_collection, collection_name_sanitize
+from embeddings import embedding_info
+from ingest import (
+    ingest_bytes, ensure_collection, collection_name_sanitize,
+    delete_document_chunks,
+)
 from database import init_db, get_session
 from models import Collection, Document, User, UsageEvent
+import contract
+import storage
 from auth_utils import (
     verify_password, get_password_hash,
     create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES,
@@ -77,15 +83,19 @@ async def lifespan(app: FastAPI):
     await init_db()
 
     # 기본 유저 생성 (최초 실행 시)
+    # 공개 배포에서는 ADMIN_EMAIL/ADMIN_PASSWORD 로 반드시 덮어쓰세요.
+    admin_email    = os.getenv("ADMIN_EMAIL", "info@gngmeta.com")
+    admin_password = os.getenv("ADMIN_PASSWORD", "admin1234")
     async for session in get_session():
-        statement = select(User).where(User.email == "info@gngmeta.com")
+        statement = select(User).where(User.email == admin_email)
         results = await session.exec(statement)
         user = results.first()
         if not user:
             default_user = User(
-                email="info@gngmeta.com",
-                hashed_password=get_password_hash("admin1234"),
-                full_name="GnG Admin",
+                email=admin_email,
+                hashed_password=get_password_hash(admin_password),
+                full_name=os.getenv("ADMIN_NAME", "GnG Admin"),
+                acl="RESTRICTED",   # 어드민은 전 등급 열람
             )
             session.add(default_user)
             await session.commit()
@@ -176,6 +186,7 @@ class ChatResponse(BaseModel):
     citations: list[dict] = []
     cached: bool
     latency_ms: int
+    retrieval: str = ""      # hybrid_rrf | dense — 어떤 검색 경로가 쓰였는지
 
 
 class AgentRequest(BaseModel):
@@ -228,6 +239,43 @@ class DocumentRead(BaseModel):
     xai_doc_id: str      # 인제스트 작업 UUID
     status: str
     created_at: str
+    # ── 데이터 계약 ──
+    stable_id: Optional[str] = None
+    version: int = 1
+    sha256: Optional[str] = None
+    acl: str = "INTERNAL"
+    owner: Optional[str] = None
+    doc_status: str = "draft"
+    mime: Optional[str] = None
+    size_bytes: Optional[int] = None
+    chunk_count: int = 0
+    has_original: bool = False
+
+
+class DocumentDetail(DocumentRead):
+    provenance: dict = {}
+    collection_id: Optional[int] = None
+    citation: str = ""
+
+
+def _doc_read(d: Document) -> DocumentRead:
+    return DocumentRead(
+        id=d.id,
+        name=d.name,
+        xai_doc_id=d.xai_doc_id,
+        status=d.status,
+        created_at=d.created_at.isoformat(),
+        stable_id=d.stable_id,
+        version=d.version or 1,
+        sha256=d.sha256,
+        acl=contract.normalize_acl(d.acl),
+        owner=d.owner,
+        doc_status=contract.normalize_doc_status(d.doc_status),
+        mime=d.mime,
+        size_bytes=d.size_bytes,
+        chunk_count=d.chunk_count or 0,
+        has_original=storage.exists(d.file_path),
+    )
 
 
 class Token(BaseModel):
@@ -245,6 +293,7 @@ class UserRead(BaseModel):
     id: int
     email: str
     full_name: Optional[str] = None
+    acl: str = "PUBLIC"          # 이 사용자가 열람 가능한 최대 등급
 
 
 # ──────────────────────────────────────────────
@@ -296,7 +345,12 @@ async def register(
 
 @app.get("/users/me", response_model=UserRead)
 async def read_users_me(current_user: User = Depends(get_current_user)):
-    return UserRead(id=current_user.id, email=current_user.email, full_name=current_user.full_name)
+    return UserRead(
+        id=current_user.id,
+        email=current_user.email,
+        full_name=current_user.full_name,
+        acl=contract.normalize_acl(current_user.acl),
+    )
 
 
 # ──────────────────────────────────────────────
@@ -312,12 +366,25 @@ async def health():
         qdrant_ok = True
     except Exception:
         pass
-    try:
-        async with httpx.AsyncClient(timeout=5) as c:
-            r = await c.get(f"{EXO_BASE_URL.rstrip('/v1')}/health")
-            exo_ok = r.status_code == 200
-    except Exception:
-        pass
+    # 로컬 추론 엔드포인트 점검.
+    # 예전에는 EXO_BASE_URL.rstrip('/v1') + '/health' 를 찔렀는데 두 군데가 틀렸습니다:
+    #   1) str.rstrip 은 접미사가 아니라 문자 집합 {'/','v','1'} 을 깎습니다.
+    #      "http://host:1/v1" → "http://host:" 가 되어 포트가 비고 80(nginx)에 갔습니다.
+    #   2) 이 자리에는 Exo 대신 Ollama 가 오는 경우가 많은데 Ollama 에는 /health 가
+    #      없어 404 → 항상 down 으로 보고됐습니다(정상 동작 중인데도).
+    # 그래서 OpenAI 호환 규격의 /v1/models 로 점검합니다 — Exo·Ollama 둘 다 구현합니다.
+    if not EXO_ENABLED:
+        exo_ok = None   # 비활성 — "down" 이 아니라 "disabled" 로 보고
+    else:
+        try:
+            base = EXO_BASE_URL.rstrip("/")
+            if not base.endswith("/v1"):
+                base = f"{base}/v1"
+            async with httpx.AsyncClient(timeout=5) as c:
+                r = await c.get(f"{base}/models")
+                exo_ok = r.status_code == 200
+        except Exception:
+            exo_ok = False
 
     # Circuit Breaker 현황
     cb_status = llm_router.status()
@@ -325,8 +392,9 @@ async def health():
     return {
         "ok":     True,
         "qdrant": "up" if qdrant_ok else "down",
-        "exo":    "up" if exo_ok else "unknown",
+        "exo":    "disabled" if exo_ok is None else ("up" if exo_ok else "down"),
         "llm":    cb_status,   # active_provider, providers 별 state
+        "embedding": embedding_info(),
     }
 
 
@@ -545,16 +613,210 @@ async def get_collection_documents(
     results = await session.exec(statement)
     documents = results.all()
 
+    # 권한 밖 문서는 목록에서도 뺀다 — 존재 자체가 정보다.
     return [
-        DocumentRead(
-            id=d.id,
-            name=d.name,
-            xai_doc_id=d.xai_doc_id,
-            status=d.status,
-            created_at=d.created_at.isoformat(),
-        )
-        for d in documents
+        _doc_read(d) for d in documents
+        if contract.can_read(current_user.acl, d.acl)
     ]
+
+
+# ──────────────────────────────────────────────
+# 문서 레지스트리 (Data Contract API)
+#
+# 다른 서비스(LLM Wiki 등)는 파일을 복사해 가는 대신 stable_id 로 참조한다.
+# 경로가 /registry 인 이유: /docs 는 FastAPI 가 Swagger UI 로 이미 쓰고 있다.
+# 캐시가 필요하면 sha256 이 같을 때만 재사용하면 된다.
+# ──────────────────────────────────────────────
+async def _docs_for_stable_id(session: AsyncSession, stable_id: str) -> list[Document]:
+    rows = await session.exec(
+        select(Document).where(Document.stable_id == stable_id)
+        .order_by(Document.version.desc())
+    )
+    return list(rows.all())
+
+
+def _pick_version(docs: list[Document], version: Optional[int]) -> Optional[Document]:
+    if not docs:
+        return None
+    if version is not None:
+        return next((d for d in docs if (d.version or 1) == version), None)
+    # 버전 미지정이면 reviewed 최신본을 우선한다. 없으면 그냥 최신본.
+    reviewed = [d for d in docs if contract.normalize_doc_status(d.doc_status) == "reviewed"]
+    return (reviewed or docs)[0]
+
+
+@app.get("/registry", response_model=list[DocumentRead])
+async def list_docs(
+    status: Optional[str] = None,          # draft/reviewed/deprecated
+    collection_id: Optional[int] = None,
+    latest_only: bool = True,
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """소비 서비스용 문서 목록. 요청자 등급으로 걸러진다."""
+    stmt = select(Document).where(Document.stable_id.is_not(None))
+    if collection_id is not None:
+        stmt = stmt.where(Document.collection_id == collection_id)
+    rows = await session.exec(stmt.order_by(Document.stable_id, Document.version.desc()))
+    docs = [d for d in rows.all() if contract.can_read(current_user.acl, d.acl)]
+
+    if status:
+        want = contract.normalize_doc_status(status)
+        docs = [d for d in docs if contract.normalize_doc_status(d.doc_status) == want]
+
+    if latest_only:
+        seen: set[str] = set()
+        latest = []
+        for d in docs:                      # 이미 version 내림차순
+            if d.stable_id in seen:
+                continue
+            seen.add(d.stable_id)
+            latest.append(d)
+        docs = latest
+
+    return [_doc_read(d) for d in docs]
+
+
+@app.get("/registry/{stable_id}", response_model=DocumentDetail)
+async def get_doc(
+    stable_id: str,
+    version: Optional[int] = None,
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    문서 메타데이터. version 을 주면 그 시점을 고정해서 가져온다
+    (`/registry/{stable_id}?version=3`).
+    """
+    docs = await _docs_for_stable_id(session, stable_id)
+    doc = _pick_version(docs, version)
+    if not doc:
+        raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다")
+    if not contract.can_read(current_user.acl, doc.acl):
+        # 권한이 없으면 존재 여부도 알리지 않는다.
+        raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다")
+
+    base = _doc_read(doc)
+    return DocumentDetail(
+        **base.model_dump(),
+        provenance=contract.parse_provenance(doc.provenance),
+        collection_id=doc.collection_id,
+        citation=contract.format_citation(doc.stable_id, doc.version or 1, doc.sha256),
+    )
+
+
+@app.get("/registry/{stable_id}/versions", response_model=list[DocumentRead])
+async def list_doc_versions(
+    stable_id: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    docs = await _docs_for_stable_id(session, stable_id)
+    docs = [d for d in docs if contract.can_read(current_user.acl, d.acl)]
+    if not docs:
+        raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다")
+    return [_doc_read(d) for d in docs]
+
+
+@app.get("/registry/{stable_id}/file")
+async def download_doc(
+    stable_id: str,
+    version: Optional[int] = None,
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """보관된 원본 파일 다운로드. ACL 검사 후 해시를 헤더로 함께 준다."""
+    from fastapi.responses import Response
+
+    docs = await _docs_for_stable_id(session, stable_id)
+    doc = _pick_version(docs, version)
+    if not doc or not contract.can_read(current_user.acl, doc.acl):
+        raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다")
+
+    content = storage.read_original(doc.file_path)
+    if content is None:
+        raise HTTPException(
+            status_code=410,
+            detail="원본이 보관되어 있지 않습니다 (계약 도입 이전 업로드).",
+        )
+
+    actual = contract.sha256_bytes(content)
+    if doc.sha256 and actual != doc.sha256:
+        # 대장과 파일이 어긋났다. 조용히 내려주면 변조를 못 잡는다.
+        raise HTTPException(status_code=409, detail="무결성 오류: 원본 해시가 대장과 다릅니다")
+
+    from urllib.parse import quote
+    return Response(
+        content=content,
+        media_type=doc.mime or "application/octet-stream",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(doc.name)}",
+            "X-Doc-Stable-Id": doc.stable_id or "",
+            "X-Doc-Version": str(doc.version or 1),
+            "X-Doc-Sha256": actual,
+            "X-Doc-Acl": contract.normalize_acl(doc.acl),
+        },
+    )
+
+
+class DocStatusUpdate(BaseModel):
+    doc_status: Optional[str] = None      # draft/reviewed/deprecated
+    acl: Optional[str] = None
+    owner: Optional[str] = None
+
+
+@app.patch("/registry/{stable_id}", response_model=DocumentRead)
+async def update_doc_governance(
+    stable_id: str,
+    body: DocStatusUpdate,
+    version: Optional[int] = None,
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    거버넌스 필드(리뷰 상태·ACL·담당)만 수정한다.
+    내용을 바꾸려면 업로드로 새 버전을 만들어야 한다 — 그게 버전의 의미다.
+    """
+    docs = await _docs_for_stable_id(session, stable_id)
+    doc = _pick_version(docs, version)
+    if not doc or not contract.can_read(current_user.acl, doc.acl):
+        raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다")
+
+    if body.doc_status is not None:
+        doc.doc_status = contract.normalize_doc_status(body.doc_status)
+    if body.acl is not None:
+        new_acl = contract.normalize_acl(body.acl)
+        if not contract.can_read(current_user.acl, new_acl):
+            raise HTTPException(status_code=403, detail="본인 등급보다 높게 올릴 수 없습니다")
+        doc.acl = new_acl
+    if body.owner is not None:
+        doc.owner = body.owner
+
+    session.add(doc)
+    await session.commit()
+    await session.refresh(doc)
+
+    # 청크 payload 의 acl/doc_status 도 맞춰 둔다 (검색 필터가 이 값을 본다).
+    try:
+        collection = await session.get(Collection, doc.collection_id)
+        if collection:
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+            get_qdrant().set_payload(
+                collection_name=collection.xai_id,
+                payload={
+                    "acl": contract.normalize_acl(doc.acl),
+                    "doc_status": contract.normalize_doc_status(doc.doc_status),
+                    "owner": doc.owner or "",
+                },
+                points=Filter(must=[
+                    FieldCondition(key="stable_id", match=MatchValue(value=stable_id)),
+                    FieldCondition(key="version", match=MatchValue(value=doc.version or 1)),
+                ]),
+            )
+    except Exception as e:
+        print(f"Warning: 청크 payload 동기화 실패: {e}")
+
+    return _doc_read(doc)
 
 
 @app.delete("/documents/{document_id}")
@@ -566,21 +828,37 @@ async def delete_document(
     doc = await session.get(Document, document_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
+    if not contract.can_read(current_user.acl, doc.acl):
+        raise HTTPException(status_code=404, detail="Document not found")
 
-    # Qdrant에서 해당 파일 청크 삭제
+    # Qdrant에서 해당 청크 삭제
     try:
         collection = await session.get(Collection, doc.collection_id)
         if collection:
             qdrant = get_qdrant()
             from qdrant_client.models import Filter, FieldCondition, MatchValue
-            qdrant.delete(
-                collection_name=collection.xai_id,
-                points_selector=Filter(
-                    must=[FieldCondition(key="source", match=MatchValue(value=doc.name))]
-                ),
-            )
+            if doc.stable_id:
+                # 계약 문서는 (stable_id, version) 으로 정확히 지운다.
+                # 파일명은 버전마다 같을 수 있어 source 로 지우면 다른 버전까지 날아간다.
+                delete_document_chunks(
+                    qdrant, collection.xai_id, doc.stable_id, doc.version or 1
+                )
+            else:
+                qdrant.delete(
+                    collection_name=collection.xai_id,
+                    points_selector=Filter(
+                        must=[FieldCondition(key="source", match=MatchValue(value=doc.name))]
+                    ),
+                )
     except Exception as e:
         print(f"Warning: Qdrant 청크 삭제 실패: {e}")
+
+    # 보관된 원본도 함께 지운다 (대장과 파일이 어긋나지 않도록).
+    if doc.stable_id and doc.file_path:
+        try:
+            storage.delete_version(doc.stable_id, doc.version or 1)
+        except Exception as e:
+            print(f"Warning: 원본 삭제 실패: {e}")
 
     await session.delete(doc)
     await session.commit()
@@ -589,6 +867,19 @@ async def delete_document(
 
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
 ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md", ".docx", ".doc"}
+
+# provenance 에 남길 파서 이름. 파서를 교체하면 이 값으로 재인제스트 대상을 찾는다.
+_PARSER_BY_EXT = {
+    ".pdf":  "PyPDF2",
+    ".docx": "python-docx",
+    ".doc":  "python-docx",
+    ".txt":  "plain",
+    ".md":   "plain",
+}
+
+
+def _parser_for(ext: str) -> str:
+    return _PARSER_BY_EXT.get(ext.lower(), "plain")
 
 
 def _extract_text_for_analyze(content: bytes, filename: str) -> str:
@@ -613,6 +904,27 @@ def _extract_text_for_analyze(content: bytes, filename: str) -> str:
     return content.decode("utf-8", errors="replace")
 
 
+async def _next_stable_id(session: AsyncSession, slug_source: str) -> str:
+    """
+    같은 (slug, 연도) 안에서 다음 일련번호를 붙여 stable_id 를 만든다.
+    시각을 넣지 않는 이유는 contract.make_stable_id 주석 참고.
+    """
+    from datetime import datetime, timezone
+
+    year = datetime.now(timezone.utc).year
+    prefix = f"doc:ets:{contract.slugify(slug_source)}-{year}-"
+    rows = await session.exec(
+        select(Document.stable_id).where(Document.stable_id.like(f"{prefix}%"))
+    )
+    seq = 0
+    for sid in rows.all():
+        try:
+            seq = max(seq, int((sid or "").rsplit("-", 1)[1]))
+        except (IndexError, ValueError):
+            continue
+    return f"{prefix}{seq + 1:03d}"
+
+
 @app.post("/collections/{collection_id}/upload")
 async def upload_document(
     collection_id: int,
@@ -625,6 +937,11 @@ async def upload_document(
     relatedDocs: Optional[str] = Form(None),
     relationship_note: Optional[str] = Form(None),
     policy_note: Optional[str] = Form(None),
+    # ── 데이터 계약 입력 ──
+    stable_id: Optional[str] = Form(None),   # 주면 그 문서의 새 버전으로 등록
+    acl: Optional[str] = Form(None),
+    owner: Optional[str] = Form(None),
+    doc_status: Optional[str] = Form(None),
     session: AsyncSession = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
@@ -664,13 +981,82 @@ async def upload_document(
 
     tag_list = [t.strip() for t in tags.split(",")] if tags else None
 
-    # DB에 먼저 기록 (processing 상태)
+    # ── 데이터 계약: stable_id 발급 또는 새 버전 ─────────────
+    doc_sha256 = contract.sha256_bytes(content)
+
+    if stable_id:
+        if not contract.is_valid_stable_id(stable_id):
+            raise HTTPException(
+                status_code=400,
+                detail="stable_id 형식이 올바르지 않습니다 (예: doc:ets:audit-2026-031)",
+            )
+        prev_rows = await session.exec(
+            select(Document).where(Document.stable_id == stable_id)
+            .order_by(Document.version.desc())
+        )
+        prev = prev_rows.first()
+        if prev is None:
+            raise HTTPException(status_code=404, detail=f"알 수 없는 stable_id: {stable_id}")
+        if not contract.can_read(current_user.acl, prev.acl):
+            raise HTTPException(status_code=403, detail="이 문서를 수정할 권한이 없습니다")
+        if prev.sha256 == doc_sha256:
+            # 내용이 같으면 버전을 올리지 않는다. 버전은 "내용이 달라졌다"는 신호여야 한다.
+            return {
+                "status": "unchanged",
+                "document_id": prev.id,
+                "stable_id": stable_id,
+                "version": prev.version,
+                "message": "동일한 내용입니다 — 새 버전을 만들지 않았습니다.",
+            }
+        doc_version = (prev.version or 1) + 1
+        doc_acl = contract.normalize_acl(acl or prev.acl)
+        doc_owner = owner or prev.owner
+    else:
+        stable_id = await _next_stable_id(session, os.path.splitext(file.filename)[0])
+        doc_version = 1
+        doc_acl = contract.normalize_acl(acl)
+        doc_owner = owner or current_user.email
+
+    # 업로더가 자기 등급보다 높은 문서를 만들면 스스로 못 읽는다 — 미리 막는다.
+    if not contract.can_read(current_user.acl, doc_acl):
+        raise HTTPException(
+            status_code=403,
+            detail=f"본인 열람 등급({contract.normalize_acl(current_user.acl)})보다 "
+                   f"높은 등급({doc_acl})으로 등록할 수 없습니다",
+        )
+
+    # ── 원본 보관 (계약의 전제) ──────────────────────────
+    try:
+        storage.ensure_root()
+        saved_path, doc_sha256 = storage.save_original(
+            stable_id, doc_version, file.filename, content
+        )
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"원본 저장 실패: {e}")
+
+    prov = contract.build_provenance(
+        original_name=file.filename,
+        parser=_parser_for(file_ext),
+        source_path=f"upload:{current_user.email}",
+        extra={"collection": collection.name, "uploaded_by": current_user.email},
+    )
+
     job_id = str(uuid.uuid4())
     doc = Document(
         name=file.filename,
         xai_doc_id=job_id,
         collection_id=collection.id,
         status="processing",
+        stable_id=stable_id,
+        version=doc_version,
+        sha256=doc_sha256,
+        acl=doc_acl,
+        owner=doc_owner,
+        doc_status=contract.normalize_doc_status(doc_status),
+        provenance=prov,
+        file_path=saved_path,
+        mime=file.content_type or "application/octet-stream",
+        size_bytes=len(content),
     )
     session.add(doc)
     await session.commit()
@@ -680,11 +1066,20 @@ async def upload_document(
     qdrant_name = collection.xai_id
     doc_id = doc.id
     file_content = content
+    sid, ver, dacl, downer = stable_id, doc_version, doc_acl, doc_owner
+    dstatus = doc.doc_status
 
     async def do_ingest():
+        chunks = 0
         try:
             qdrant = get_qdrant()
             ensure_collection(qdrant, qdrant_name)
+            # 같은 버전을 재인제스트하는 경우 이전 청크를 먼저 지운다.
+            if ver > 1:
+                try:
+                    delete_document_chunks(qdrant, qdrant_name, sid, ver)
+                except Exception:
+                    pass
             chunks = ingest_bytes(
                 client=qdrant,
                 collection_name=qdrant_name,
@@ -693,17 +1088,29 @@ async def upload_document(
                 category=category,
                 tags=tag_list,
                 extra_metadata=extra_meta,
+                stable_id=sid,
+                version=ver,
+                sha256=doc_sha256,
+                acl=dacl,
+                owner=downer,
+                doc_status=dstatus,
             )
-            new_status = "processed" if chunks > 0 else "failed"
+            if chunks > 0:
+                new_status = "processed"
+            elif dacl in contract.ACL_NO_INDEX:
+                # RESTRICTED 는 의도적으로 색인하지 않는다 — 실패가 아니다.
+                new_status = "stored_not_indexed"
+            else:
+                new_status = "failed"
         except Exception as e:
             print(f"인제스트 실패 ({file.filename}): {e}")
             new_status = "failed"
 
-        # 상태 업데이트
         async for s in get_session():
             d = await s.get(Document, doc_id)
             if d:
                 d.status = new_status
+                d.chunk_count = chunks
                 s.add(d)
                 await s.commit()
             break
@@ -714,6 +1121,11 @@ async def upload_document(
         "status": "processing",
         "document_id": doc.id,
         "job_id": job_id,
+        "stable_id": stable_id,
+        "version": doc_version,
+        "sha256": doc_sha256,
+        "acl": doc_acl,
+        "citation": contract.format_citation(stable_id, doc_version, doc_sha256),
         "message": "백그라운드에서 인제스트 중입니다. /collections/{id} 에서 상태를 확인하세요.",
     }
 
@@ -872,8 +1284,9 @@ async def chat(
 
     filters_dict = req.filters.model_dump(exclude_none=True) if req.filters else None
 
-    # 캐시 확인
-    cached = cache_get(qdrant_collection, LLM_MODEL, req.query, filters_dict)
+    # 캐시 확인 — 열람 등급이 키에 포함되어야 등급 간 답변이 섞이지 않는다.
+    viewer_acl = contract.normalize_acl(current_user.acl)
+    cached = cache_get(qdrant_collection, LLM_MODEL, req.query, filters_dict, viewer_acl)
     if cached:
         return ChatResponse(
             request_id=request_id,
@@ -881,14 +1294,29 @@ async def chat(
             citations=cached.get("citations", []),
             cached=True,
             latency_ms=int((time.time() - t0) * 1000),
+            retrieval=cached.get("retrieval", ""),
         )
 
     # RAG 실행
-    result = await run_rag(
-        collection_name=qdrant_collection,
-        query=req.query,
-        filters=filters_dict,
-    )
+    # 모든 LLM 프로바이더가 죽었거나(회로 개방) API 키가 비어 있으면 라우터가
+    # RuntimeError 를 던집니다. 그대로 두면 프론트에 맨 500 만 떨어져서
+    # "왜 안 되는지" 를 알 수 없으므로 원인을 실어 503 으로 내려보냅니다.
+    try:
+        result = await run_rag(
+            collection_name=qdrant_collection,
+            query=req.query,
+            filters=filters_dict,
+            viewer_acl=current_user.acl,
+        )
+    except RuntimeError as e:
+        available = llm_router.status().get("available") or []
+        detail = (
+            "LLM 프로바이더를 사용할 수 없습니다. "
+            + ("모든 프로바이더의 Circuit Breaker 가 열려 있습니다. "
+               if available else "설정된 API 키가 없습니다 (XAI_API_KEY 등을 확인하세요). ")
+            + f"원인: {e}"
+        )
+        raise HTTPException(status_code=503, detail=detail)
 
     # 사용량 기록
     usage = result.get("usage", {})
@@ -918,7 +1346,7 @@ async def chat(
     except Exception as e:
         print(f"Warning: 사용량 기록 실패: {e}")
 
-    cache_set(qdrant_collection, LLM_MODEL, req.query, filters_dict, result)
+    cache_set(qdrant_collection, LLM_MODEL, req.query, filters_dict, result, viewer_acl)
 
     return ChatResponse(
         request_id=request_id,
@@ -926,6 +1354,7 @@ async def chat(
         citations=result.get("citations", []),
         cached=False,
         latency_ms=int((time.time() - t0) * 1000),
+        retrieval=result.get("retrieval", ""),
     )
 
 
