@@ -12,6 +12,7 @@ app.py — FastAPI 메인 애플리케이션
 - Document.xai_doc_id 필드 = 인제스트 작업 UUID로 재사용
 """
 import asyncio
+import secrets
 import uuid
 import time
 import os
@@ -36,6 +37,7 @@ from qdrant_client.models import Distance, VectorParams, OptimizersConfigDiff
 
 from config import (
     EXO_ENABLED, EXO_BASE_URL, EXO_API_KEY, LLM_MODEL,
+    INTERNAL_API_TOKEN,
     QDRANT_HOST, QDRANT_PORT, QDRANT_API_KEY,
     EMBED_DIM, CACHE_TTL_SEC, CACHE_MAXSIZE,
     COST_PER_1M_INPUT, COST_PER_1M_OUTPUT,
@@ -176,7 +178,9 @@ class Filters(BaseModel):
 
 class ChatRequest(BaseModel):
     query: str = Field(..., min_length=1)
-    collection_id: int = Field(..., description="검색할 컬렉션 ID")
+    # 0 이면 전체 컬렉션을 한 번에 검색한다. 보고서를 사업장별로 나눈 뒤
+    # "화학 분야 보고서" 같은 가로지르는 질문을 할 수 없던 것을 푸는 값이다.
+    collection_id: int = Field(..., description="검색할 컬렉션 ID (0=전체)")
     filters: Filters | None = None
 
 
@@ -442,6 +446,165 @@ async def get_stats(
         "cost_usd":     float(total_cost),
         "stack":        f"Exo/{LLM_MODEL} + Qdrant + CrewAI",
     }
+
+
+# ──────────────────────────────────────────────
+# 내부 API — 서비스 간 호출 전용 (사용자 JWT 가 아니라 공유 토큰으로 인증)
+#
+# LLM Wiki(work.ets0404.com)가 "RAG 에 이미 있는 문서" 를 골라 위키로 넘길 때 쓴다.
+# 사람이 파일을 다시 업로드하지 않아도 되게 하려는 것이고, 같은 호스트의 루프백
+# 호출이라 토큰이 브라우저로 나가지 않는다.
+# ──────────────────────────────────────────────
+from fastapi import Header
+from fastapi.responses import FileResponse
+
+
+def _require_internal(x_internal_token: str | None = Header(default=None)):
+    if not INTERNAL_API_TOKEN:
+        raise HTTPException(503, "내부 API 가 설정되지 않았습니다 (INTERNAL_API_TOKEN).")
+    # 길이가 달라도 상수시간 비교를 쓴다 — 토큰 추측에 응답시간 단서를 주지 않는다.
+    if not x_internal_token or not secrets.compare_digest(x_internal_token, INTERNAL_API_TOKEN):
+        raise HTTPException(401, "내부 토큰이 유효하지 않습니다.")
+    return True
+
+
+@app.get("/internal/documents")
+async def internal_documents(
+    _: bool = Depends(_require_internal),
+    session: AsyncSession = Depends(get_session),
+):
+    """위키로 넘길 수 있는 문서 = 원본 파일이 보관된 것만."""
+    rows = (await session.exec(
+        select(Document, Collection.name)
+        .join(Collection, Document.collection_id == Collection.id, isouter=True)
+        .where(Document.file_path.is_not(None))
+        .order_by(Document.id.desc())
+    )).all()
+    out = []
+    for d, cname in rows:
+        # DB 에는 있는데 파일이 사라진 경우를 목록에서 걸러 낸다 — 고를 수 있는데
+        # 누르면 404 나는 항목이 화면에 남지 않게.
+        if not d.file_path or not os.path.exists(d.file_path):
+            continue
+        out.append({
+            "id":              d.id,
+            "name":            d.name,
+            "collection_name": cname,
+            "stable_id":       d.stable_id,
+            "sha256":          d.sha256,
+            "size_bytes":      d.size_bytes,
+            "chunk_count":     d.chunk_count,
+            "acl":             d.acl,
+            "created_at":      d.created_at,
+        })
+    return {"documents": out, "count": len(out)}
+
+
+@app.get("/internal/documents/{document_id}/file")
+async def internal_document_file(
+    document_id: int,
+    _: bool = Depends(_require_internal),
+    session: AsyncSession = Depends(get_session),
+):
+    """보관된 원본 파일을 그대로 내려준다."""
+    d = await session.get(Document, document_id)
+    if not d:
+        raise HTTPException(404, "문서를 찾을 수 없습니다.")
+    if not d.file_path or not os.path.exists(d.file_path):
+        raise HTTPException(404, "원본 파일이 보관되어 있지 않습니다.")
+    return FileResponse(
+        d.file_path,
+        media_type=d.mime or "application/pdf",
+        filename=d.name,
+    )
+
+
+# ──────────────────────────────────────────────
+# 통계 드릴다운 — 대시보드 카드의 숫자를 눌렀을 때 근거를 보여준다.
+# /stats 는 개수만 주므로 "6이 어느 문서인지" 를 확인할 방법이 없었다.
+# ──────────────────────────────────────────────
+@app.get("/stats/documents")
+async def stats_documents(
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """'처리된 문서' 카드의 내역 — 전 컬렉션의 문서 목록."""
+    rows = (await session.exec(
+        select(Document, Collection.name)
+        .join(Collection, Document.collection_id == Collection.id, isouter=True)
+        .order_by(Document.id.desc())
+    )).all()
+    return [
+        {
+            "id":              d.id,
+            "name":            d.name,
+            "collection_id":   d.collection_id,
+            "collection_name": cname,
+            "status":          d.status,
+            "chunk_count":     d.chunk_count,
+            "size_bytes":      d.size_bytes,
+            "acl":             d.acl,
+            "doc_status":      d.doc_status,
+            "owner":           d.owner,
+            "created_at":      d.created_at,
+        }
+        for d, cname in rows
+    ]
+
+
+@app.get("/stats/queries")
+async def stats_queries(
+    limit: int = 100,
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """'검색 쿼리' · '응답 시간' 카드의 내역 — 최근 호출 기록."""
+    limit = max(1, min(limit, 500))
+    rows = (await session.exec(
+        select(UsageEvent, Collection.name)
+        .join(Collection, UsageEvent.collection_id == Collection.id, isouter=True)
+        .order_by(UsageEvent.id.desc())
+        .limit(limit)
+    )).all()
+    return [
+        {
+            "id":              e.id,
+            "endpoint":        e.endpoint,
+            "model":           e.model,
+            "collection_id":   e.collection_id,
+            "collection_name": cname,
+            "latency_ms":      e.latency_ms,
+            "total_tokens":    e.total_tokens,
+            "cached":          e.cached,
+            "created_at":      e.created_at,
+        }
+        for e, cname in rows
+    ]
+
+
+@app.get("/stats/collections")
+async def stats_collections(
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """'활성 컬렉션' 카드의 내역 — 컬렉션별 문서/청크 수."""
+    cols = (await session.exec(select(Collection).order_by(Collection.id))).all()
+    out = []
+    for c in cols:
+        docs = (await session.exec(
+            select(Document).where(Document.collection_id == c.id)
+        )).all()
+        out.append({
+            "id":          c.id,
+            "name":        c.name,
+            "qdrant_name": c.xai_id,
+            "description": c.description,
+            "documents":   len(docs),
+            "chunks":      sum(d.chunk_count or 0 for d in docs),
+            "processed":   sum(1 for d in docs if d.status == "processed"),
+            "created_at":  c.created_at,
+        })
+    return out
 
 
 # ──────────────────────────────────────────────
@@ -1259,20 +1422,46 @@ async def chat(
     session: AsyncSession = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    db_collection = await session.get(Collection, req.collection_id)
-    if not db_collection:
-        raise HTTPException(status_code=404, detail="지정한 컬렉션을 찾을 수 없습니다.")
-
-    qdrant_collection = db_collection.xai_id
     request_id = str(uuid.uuid4())
     t0 = time.time()
 
-    # 문서 없는 경우 조기 반환
-    doc_count = (await session.exec(
-        select(func.count(Document.id)).where(
-            (Document.collection_id == db_collection.id) & (Document.status == "processed")
-        )
-    )).one()
+    # collection_id=0 → 전체 검색. 컬렉션을 하나 고르게 하면 여러 사업장을
+    # 가로지르는 질문("화학 분야 보고서")을 아예 할 수 없다.
+    search_all = req.collection_id == 0
+    if search_all:
+        rows = (await session.exec(
+            select(Collection.id, Collection.xai_id, Collection.name)
+        )).all()
+        counts = {
+            cid: n for cid, n in (await session.exec(
+                select(Document.collection_id, func.count(Document.id))
+                .where(Document.status == "processed")
+                .group_by(Document.collection_id)
+            )).all()
+        }
+        usable = [(cid, xid, name) for cid, xid, name in rows if counts.get(cid)]
+        if not usable:
+            return ChatResponse(
+                request_id=request_id,
+                answer="인덱싱된 문서가 없습니다. 먼저 문서를 업로드하고 인제스트를 기다려 주세요.",
+                citations=[], cached=False,
+                latency_ms=int((time.time() - t0) * 1000),
+            )
+        qdrant_names = [xid for _, xid, _ in usable]
+        qdrant_collection = "|".join(sorted(qdrant_names))   # 캐시 키 용도
+        db_collection = None
+        doc_count = sum(counts.get(cid, 0) for cid, _, _ in usable)
+    else:
+        db_collection = await session.get(Collection, req.collection_id)
+        if not db_collection:
+            raise HTTPException(status_code=404, detail="지정한 컬렉션을 찾을 수 없습니다.")
+        qdrant_collection = db_collection.xai_id
+        qdrant_names = None
+        doc_count = (await session.exec(
+            select(func.count(Document.id)).where(
+                (Document.collection_id == db_collection.id) & (Document.status == "processed")
+            )
+        )).one()
     if doc_count == 0:
         return ChatResponse(
             request_id=request_id,
@@ -1307,6 +1496,7 @@ async def chat(
             query=req.query,
             filters=filters_dict,
             viewer_acl=current_user.acl,
+            collection_names=qdrant_names,
         )
     except RuntimeError as e:
         available = llm_router.status().get("available") or []
@@ -1334,7 +1524,7 @@ async def chat(
         session.add(UsageEvent(
             endpoint="/chat",
             model=LLM_MODEL,
-            collection_id=db_collection.id,
+            collection_id=db_collection.id if db_collection else None,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,

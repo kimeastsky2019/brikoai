@@ -4,17 +4,21 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Search, Upload, Brain, Zap, FileText, MessageSquare, Settings, BarChart3, LogIn, LogOut } from "lucide-react";
+import { Search, Brain, FileText, Zap, ChevronDown, ChevronUp, Loader2 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { api, ChatResponse, Collection } from "@/lib/api";
 import { toast } from "sonner";
-import Header from "@/components/Header"; // Import Header
+import SidebarLayout from "@/components/SidebarLayout";
+import StatDetailDialog, { StatKind } from "@/components/StatDetailDialog";
+
+const ALL = "all";
 
 const Index = () => {
   const navigate = useNavigate();
   const [query, setQuery] = useState("");
+  const [statDetail, setStatDetail] = useState<StatKind | null>(null);
   const [isSearching, setIsSearching] = useState(false);
   const [response, setResponse] = useState<ChatResponse | null>(null);
   const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -22,10 +26,15 @@ const Index = () => {
   const [selectedCollectionId, setSelectedCollectionId] = useState<string>("");
   const [collectionSummary, setCollectionSummary] = useState<{ total: number; processed: number; processing: number; failed: number } | null>(null);
   const [summaryPolling, setSummaryPolling] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [showFilters, setShowFilters] = useState(false);
+  
+  // Search Filters
   const [filterCategory, setFilterCategory] = useState("");
   const [filterTags, setFilterTags] = useState("");
   const [filterDateFrom, setFilterDateFrom] = useState("");
   const [filterDateTo, setFilterDateTo] = useState("");
+
   const [dashboardStats, setDashboardStats] = useState<{ documents: number; collections: number; queries: number } | null>(null);
   const [searchCount, setSearchCount] = useState(0);
   const [lastLatencyMs, setLastLatencyMs] = useState<number | null>(null);
@@ -41,14 +50,26 @@ const Index = () => {
     api.getCollections()
       .then((data) => {
         setCollections(data);
+        setLoadFailed(false);
         const stored = localStorage.getItem("rag_collection_id");
-        const nextId = stored && data.some((c) => String(c.id) === stored) ? stored : (data[0] ? String(data[0].id) : "");
+        const nextId = stored && (stored === ALL || data.some((c) => String(c.id) === stored))
+          ? stored
+          : ALL;
         setSelectedCollectionId(nextId);
-        if (nextId) localStorage.setItem("rag_collection_id", nextId);
+        localStorage.setItem("rag_collection_id", nextId);
       })
       .catch((e) => {
         console.error(e);
-        toast.error("컬렉션 목록을 불러오지 못했습니다.");
+        setLoadFailed(true);
+        const expired = String(e?.message || "").includes("401") || !localStorage.getItem("token");
+        if (expired) {
+          toast.error("로그인이 만료되었습니다. 다시 로그인해 주세요.");
+          localStorage.removeItem("token");
+          setIsLoggedIn(false);
+          navigate("/login");
+        } else {
+          toast.error("컬렉션 목록을 불러오지 못했습니다. 문서가 지워진 것은 아닙니다.");
+        }
       });
   }, [isLoggedIn]);
 
@@ -100,20 +121,6 @@ const Index = () => {
     };
   }, [isLoggedIn, selectedCollectionId]);
 
-  const handleAuthAction = (action: () => void) => {
-    if (isLoggedIn) {
-      action();
-    } else {
-      navigate("/login");
-    }
-  };
-
-  const handleLogout = () => {
-    api.logout();
-    setIsLoggedIn(false);
-    toast.info("로그아웃되었습니다.");
-  };
-
   const handleSearch = async () => {
     if (!query.trim()) return;
 
@@ -123,7 +130,7 @@ const Index = () => {
       return;
     }
     if (!selectedCollectionId) {
-      toast.error("검색할 컬렉션을 선택해 주세요.");
+      toast.error("검색 범위를 선택해 주세요.");
       return;
     }
 
@@ -141,7 +148,7 @@ const Index = () => {
 
       const res = await api.chat(
         query,
-        Number(selectedCollectionId),
+        selectedCollectionId === ALL ? 0 : Number(selectedCollectionId),
         Object.keys(filters).length ? filters : undefined
       );
       setResponse(res);
@@ -165,420 +172,360 @@ const Index = () => {
     }
   };
 
-  const features = [
-    {
-      icon: Brain,
-      title: "AI 기반 검색",
-      description: "Grok API를 활용한 지능형 문서 검색 및 질의응답"
-    },
-    {
-      icon: Upload,
-      title: "문서 업로드",
-      description: "PDF, TXT 등 다양한 형식의 문서를 컬렉션에 업로드"
-    },
-    {
-      icon: Zap,
-      title: "실시간 처리",
-      description: "빠른 임베딩 처리와 실시간 검색 결과 제공"
-    },
-    {
-      icon: FileText,
-      title: "컬렉션 관리",
-      description: "문서를 주제별로 분류하고 효율적으로 관리"
-    }
-  ];
-
   const stats = [
     {
       label: "처리된 문서",
       value: dashboardStats ? dashboardStats.documents.toLocaleString() : "—",
       icon: FileText,
+      kind: "documents" as const,
     },
     {
       label: "검색 쿼리",
       value: (dashboardStats ? dashboardStats.queries : 0) + searchCount,
       icon: Search,
+      kind: "queries" as const,
     },
     {
       label: "활성 컬렉션",
       value: dashboardStats ? dashboardStats.collections : "—",
       icon: Brain,
+      kind: "collections" as const,
     },
     {
-      label: "응답 시간",
+      label: "응답 속도",
       value: lastLatencyMs !== null ? `${Math.max(0.1, Math.round(lastLatencyMs / 100) / 10)}초` : "—",
       icon: Zap,
+      kind: "latency" as const,
     },
   ];
 
+  // Recommended knowledge cards structured using the required 4-column summary format
+  const recommendedKnowledge = [
+    {
+      title: "보일러 급수 예열 (폐열회수 ECM)",
+      current: "210°C (배가스 출구)",
+      target: "160°C",
+      diff: "+50°C",
+      verdict: "보일러 배가스 출구에 급수 예열용 이코노마이저 추가 설치 제안 (예상 투자회수기간: 2.3년)"
+    },
+    {
+      title: "송풍기/펌프 모터 운전 (인버터 제어 ECM)",
+      current: "50Hz (밸브 조절 운전)",
+      target: "35Hz",
+      diff: "+15Hz",
+      verdict: "가동율 변동에 맞춰 인버터 VVVF 주파수 제어 도입 추천 (32% 전력량 저감)"
+    },
+    {
+      title: "압축공기 누기 실태 점검 (공정 보전 ECM)",
+      current: "22.5% (추정 누기율)",
+      target: "10.0%",
+      diff: "+12.5%",
+      verdict: "현장 누출 부속 실사 후 밸브·커플링 밀봉 작업 추천 (연간 가동 비용 즉각 절감)"
+    }
+  ];
+
+  const headerCta = (
+    <Button
+      onClick={handleSearch}
+      disabled={!query.trim() || isSearching}
+      className="bg-[#5146E5] hover:bg-[#5146E5]/90 text-white font-semibold shadow-lg shadow-[#5146E5]/25 rounded-lg px-5 py-2.5 outline-none"
+    >
+      {isSearching ? (
+        <>
+          <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+          검색 중...
+        </>
+      ) : (
+        <>
+          <Search className="h-4 w-4 mr-2" />
+          AI 검색 시작
+        </>
+      )}
+    </Button>
+  );
+
   return (
-    <div className="min-h-screen bg-gradient-to-br from-background via-background to-muted/20">
-      <Header />
+    <SidebarLayout
+      title="진단 탐색"
+      description="사내 온프레미스 GPU에 적재된 진단 지식(LLM Wiki)을 대상으로 자연어 질문을 작성하고, 출처가 명시된 근거 답변을 탐색합니다."
+      statusLine={
+        lastLatencyMs !== null
+          ? `최근 RAG 검색 소요 시간: ${lastLatencyMs}ms (캐시: ${response?.cached ? "적용" : "미적용"})`
+          : "상태: AI 검색 준비 완료"
+      }
+      cta={headerCta}
+    >
+      <div className="max-w-5xl mx-auto space-y-6">
+        
+        {/* Search & Filter Compact Box */}
+        <Card className="rounded-xl border border-slate-200/80 shadow-sm bg-white overflow-hidden">
+          <CardContent className="p-5 space-y-4">
+            
+            {/* Horizontal Filter Area (One line layout) */}
+            <div className="flex flex-col md:flex-row md:items-center gap-3 bg-slate-50/50 p-3 rounded-lg border border-slate-100">
+              
+              <div className="flex-1 space-y-1">
+                <Label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">검색 범위 (컬렉션)</Label>
+                <Select
+                  value={selectedCollectionId}
+                  onValueChange={(value) => {
+                    setSelectedCollectionId(value);
+                    localStorage.setItem("rag_collection_id", value);
+                  }}
+                  disabled={!isLoggedIn}
+                >
+                  <SelectTrigger className="h-9 bg-white border-slate-200 rounded-lg text-xs">
+                    <SelectValue placeholder="검색 범위 선택" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value={ALL}>
+                      전체 보고서 {collections.length > 0 && ` (${collections.length}건)`}
+                    </SelectItem>
+                    {collections.map((c) => (
+                      <SelectItem key={c.id} value={String(c.id)}>
+                        {c.name} {typeof c.documents_count === "number" && ` (${c.documents_count}개)`}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
 
-      {/* Hero Section */}
+              <div className="md:w-36 space-y-1">
+                <Label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">카테고리</Label>
+                <Input
+                  placeholder="예: 정책, 보고서"
+                  value={filterCategory}
+                  onChange={(e) => setFilterCategory(e.target.value)}
+                  disabled={!isLoggedIn}
+                  className="h-9 bg-white border-slate-200 rounded-lg text-xs"
+                />
+              </div>
 
-      {/* Hero Section */}
-      <section className="py-20 px-4">
-        <div className="container mx-auto text-center">
-          <div className="max-w-4xl mx-auto">
-            <h2 className="text-5xl md:text-6xl font-bold mb-6">
-              <span className="gradient-text">AI 기반</span> 문서 검색의
-              <br />새로운 패러다임
-            </h2>
-            <p className="text-xl text-muted-foreground mb-8 max-w-2xl mx-auto">
-              Grok API와 Collections를 활용하여 복잡한 문서에서 정확한 답변을 찾아보세요.
-              RAG 기술로 환각 없는 신뢰할 수 있는 정보를 제공합니다.
-            </p>
+              <div className="md:w-44 space-y-1">
+                <Label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">태그 필터</Label>
+                <Input
+                  placeholder="쉼표로 태그 구분"
+                  value={filterTags}
+                  onChange={(e) => setFilterTags(e.target.value)}
+                  disabled={!isLoggedIn}
+                  className="h-9 bg-white border-slate-200 rounded-lg text-xs"
+                />
+              </div>
 
-            {/* Search Interface */}
-            <div className="max-w-2xl mx-auto mb-12">
-              <Card className="ai-glow border-primary/20">
-                <CardContent className="p-6">
-                  <div className="flex flex-col space-y-4">
-                    <div className="text-left space-y-2">
-                      <label className="text-sm font-medium text-muted-foreground">검색 컬렉션</label>
-                      <Select
-                        value={selectedCollectionId}
-                        onValueChange={(value) => {
-                          setSelectedCollectionId(value);
-                          localStorage.setItem("rag_collection_id", value);
-                        }}
-                        disabled={!isLoggedIn || collections.length === 0}
-                      >
-                        <SelectTrigger className="mt-1">
-                          <SelectValue placeholder={collections.length === 0 ? "컬렉션이 없습니다" : "컬렉션 선택"} />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {collections.map((c) => (
-                            <SelectItem key={c.id} value={String(c.id)}>
-                              {c.name}
-                              {typeof c.documents_count === "number" && ` (${c.documents_count}개)`}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                      {!isLoggedIn && (
-                        <p className="text-xs text-muted-foreground">로그인 후 컬렉션을 선택할 수 있습니다.</p>
-                      )}
-                      {isLoggedIn && collections.length === 0 && (
-                        <p className="text-xs text-muted-foreground">
-                          컬렉션이 없습니다. 먼저 문서를 업로드해 주세요.
-                        </p>
-                      )}
-                    </div>
-                    {collectionSummary && (
-                      <div className="rounded-md border bg-muted/40 px-4 py-3 text-sm text-muted-foreground">
-                        <div className="flex flex-wrap items-center gap-2 text-sm">
-                          <span>문서 {collectionSummary.total}개</span>
-                          <span>• 처리완료 {collectionSummary.processed}</span>
-                          <span>• 인덱싱 {collectionSummary.processing}</span>
-                          <span>• 실패 {collectionSummary.failed}</span>
-                        </div>
-                        {summaryPolling && (
-                          <div className="mt-1 text-xs">
-                            인덱싱 중인 문서가 있어 5초마다 상태를 갱신합니다.
-                          </div>
-                        )}
-                      </div>
-                    )}
-                    <div className="grid grid-cols-1 gap-3 text-left md:grid-cols-2">
-                      <div className="space-y-1">
-                        <label className="text-sm font-medium text-muted-foreground">카테고리</label>
-                        <Input
-                          placeholder="예: 정책, 공고"
-                          value={filterCategory}
-                          onChange={(e) => setFilterCategory(e.target.value)}
-                        />
-                      </div>
-                      <div className="space-y-1">
-                        <label className="text-sm font-medium text-muted-foreground">태그</label>
-                        <Input
-                          placeholder="예: 광주, 특구 (쉼표로 구분)"
-                          value={filterTags}
-                          onChange={(e) => setFilterTags(e.target.value)}
-                        />
-                      </div>
-                      <div className="space-y-1">
-                        <label className="text-sm font-medium text-muted-foreground">시작일</label>
-                        <Input
-                          type="date"
-                          value={filterDateFrom}
-                          onChange={(e) => setFilterDateFrom(e.target.value)}
-                        />
-                      </div>
-                      <div className="space-y-1">
-                        <label className="text-sm font-medium text-muted-foreground">종료일</label>
-                        <Input
-                          type="date"
-                          value={filterDateTo}
-                          onChange={(e) => setFilterDateTo(e.target.value)}
-                        />
-                      </div>
-                    </div>
-                    <Textarea
-                      placeholder={isLoggedIn ? "문서에 대해 궁금한 것을 질문해보세요... (예: '프로젝트 예산은 얼마인가요?')" : "검색하려면 로그인이 필요합니다."}
-                      value={query}
-                      onChange={(e) => setQuery(e.target.value)}
-                      className="min-h-[100px] resize-none border-primary/20 focus:border-primary"
-                      onClick={() => !isLoggedIn && navigate("/login")}
-                    />
-                    <Button
-                      onClick={handleSearch}
-                      disabled={!query.trim() || isSearching}
-                      className="w-full bg-gradient-to-r from-primary to-primary-glow hover:from-primary-glow hover:to-primary ai-glow"
-                      size="lg"
+              <div className="md:w-28 space-y-1">
+                <Label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">시작일</Label>
+                <Input
+                  type="date"
+                  value={filterDateFrom}
+                  onChange={(e) => setFilterDateFrom(e.target.value)}
+                  disabled={!isLoggedIn}
+                  className="h-9 bg-white border-slate-200 rounded-lg text-xs"
+                />
+              </div>
+
+              <div className="md:w-28 space-y-1">
+                <Label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">종료일</Label>
+                <Input
+                  type="date"
+                  value={filterDateTo}
+                  onChange={(e) => setFilterDateTo(e.target.value)}
+                  disabled={!isLoggedIn}
+                  className="h-9 bg-white border-slate-200 rounded-lg text-xs"
+                />
+              </div>
+            </div>
+
+            {/* Collection Processing Stats Block */}
+            {collectionSummary && (
+              <div className="rounded-lg border border-slate-100 bg-slate-50/50 px-4 py-2.5 text-xs text-slate-500 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <span>수집 문서: <strong>{collectionSummary.total}개</strong></span>
+                  <span>•</span>
+                  <span className="text-[#17B890]">처리 완료: <strong>{collectionSummary.processed}</strong></span>
+                  <span>•</span>
+                  <span className="text-indigo-600">인덱싱 중: <strong>{collectionSummary.processing}</strong></span>
+                  <span>•</span>
+                  <span className="text-red-500">실패: <strong>{collectionSummary.failed}</strong></span>
+                </div>
+                {summaryPolling && (
+                  <span className="text-[10px] bg-indigo-50 text-indigo-700 px-1.5 py-0.5 rounded font-medium animate-pulse">
+                    인덱싱 자동 동기화 중 (5초 간격)
+                  </span>
+                )}
+              </div>
+            )}
+
+            {/* Prompt input field */}
+            <div className="space-y-3">
+              <Textarea
+                placeholder={
+                  isLoggedIn
+                    ? "에너지 진단 관련 질문을 입력하세요.\n예: '보일러 배가스 폐열회수 이코노마이저 설치 시 평균 회수기간은?' 또는 '압축공기 누기율 기준을 위반한 사업장은?'"
+                    : "로그인 세션이 유효하지 않습니다. 좌측 메뉴 하단의 로그인 버튼을 이용해주세요."
+                }
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                className="min-h-[110px] resize-none rounded-lg border-slate-200 focus:border-[#5146E5] focus:ring-1 focus:ring-[#5146E5] text-sm leading-relaxed p-3.5 outline-none"
+                onClick={() => !isLoggedIn && navigate("/login")}
+              />
+              
+              {isLoggedIn && !query && collections.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 items-center">
+                  <span className="text-xs font-bold text-slate-400 mr-1">추천 질의:</span>
+                  {[
+                    "개선 권고사항과 예상 절감액을 정리해줘",
+                    "회수기간이 가장 짧은 개선안은?",
+                    "공기압축기 관련 지적사항을 모아줘",
+                  ].map((q) => (
+                    <button
+                      key={q}
+                      type="button"
+                      onClick={() => setQuery(q)}
+                      className="text-xs rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-slate-600 hover:border-[#5146E5] hover:text-[#5146E5] transition-colors"
                     >
-                      {isSearching ? (
-                        <>
-                          <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin mr-2" />
-                          검색 중...
-                        </>
-                      ) : (
-                        <>
-                          <Search className="w-5 h-5 mr-2" />
-                          AI 검색 시작
-                        </>
-                      )}
-                    </Button>
-                  </div>
-                </CardContent>
-              </Card>
-
-              {/* Answer Section */}
-              {response && (
-                <div className="mt-8 text-left animate-in fade-in slide-in-from-bottom-4 duration-500">
-                  <Card className="border-primary/20 bg-white/50 backdrop-blur-sm">
-                    <CardHeader>
-                      <CardTitle className="flex items-center text-lg">
-                        <Brain className="w-5 h-5 mr-2 text-primary" />
-                        AI 답변
-                      </CardTitle>
-                    </CardHeader>
-                    <CardContent className="space-y-4">
-                      {response.answer.startsWith("문서가 아직 인덱싱") && (
-                        <div className="rounded-lg border border-primary/20 bg-primary/5 p-4">
-                          <div className="flex items-center space-x-3">
-                            <div className="h-8 w-8 rounded-full border-2 border-primary/30 border-t-primary animate-spin" />
-                            <div>
-                              <p className="text-sm font-semibold text-primary">인덱싱 진행 중</p>
-                              <p className="text-xs text-muted-foreground">문서 처리 중입니다. 완료되면 검색 결과가 자동으로 풍부해집니다.</p>
-                            </div>
-                          </div>
-                          <div className="mt-3 h-2 w-full overflow-hidden rounded-full bg-primary/10">
-                            <div className="h-full w-2/3 animate-pulse rounded-full bg-gradient-to-r from-primary/40 via-primary/70 to-primary/40" />
-                          </div>
-                        </div>
-                      )}
-                      <div className="prose prose-sm max-w-none text-gray-800 whitespace-pre-wrap">
-                        {response.answer}
-                      </div>
-                      <div className="text-xs text-muted-foreground">
-                        ※ 이 답변은 문서 내 텍스트와 이미지에서 추출된 텍스트 기반입니다.
-                      </div>
-
-                      {response.citations && response.citations.length > 0 && (
-                        <div className="mt-4 pt-4 border-t">
-                          <h4 className="text-sm font-semibold mb-2 flex items-center text-muted-foreground">
-                            <FileText className="w-4 h-4 mr-2" />
-                            참고 문서 (Citations)
-                          </h4>
-                          <div className="grid gap-2">
-                            {response.citations.map((cite, idx) => (
-                              <div key={idx} className="text-xs bg-muted p-2 rounded flex items-start">
-                                <Badge variant="outline" className="mr-2 shrink-0">{idx + 1}</Badge>
-                                <div>
-                                  <span className="font-medium text-primary block mb-1">
-                                    {cite.title || "Untitled Document"}
-                                  </span>
-                                  <span className="text-muted-foreground line-clamp-2">
-                                    {cite.content || cite.snippet}
-                                  </span>
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-
-                      <div className="text-xs text-right text-muted-foreground pt-2">
-                        응답 시간: {response.latency_ms}ms {response.cached && "(캐시됨)"}
-                      </div>
-                    </CardContent>
-                  </Card>
+                      {q}
+                    </button>
+                  ))}
                 </div>
               )}
-
             </div>
 
-            {/* Quick Stats */}
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-16">
-              {stats.map((stat, index) => {
-                const Icon = stat.icon;
-                return (
-                  <Card key={index} className="text-center hover:shadow-lg transition-all duration-300">
-                    <CardContent className="p-4">
-                      <Icon className="w-8 h-8 mx-auto mb-2 text-primary" />
-                      <div
-                        key={`${index}-${statsTick}`}
-                        className="text-2xl font-bold text-primary transition-all duration-500 ease-out animate-in zoom-in-50"
-                      >
-                        {stat.value}
+          </CardContent>
+        </Card>
+
+        {/* Answer Output Grid */}
+        {response ? (
+          <div className="space-y-6 animate-in fade-in slide-in-from-bottom-3 duration-300">
+            <Card className="rounded-xl border border-indigo-100 shadow-sm bg-white overflow-hidden">
+              <CardHeader className="border-b border-indigo-50/50 bg-indigo-50/10 flex flex-row items-center justify-between py-3.5 px-5">
+                <CardTitle className="text-base font-bold text-slate-800 flex items-center gap-2">
+                  <Brain className="w-5 h-5 text-[#5146E5]" />
+                  AI 추론 답변 (근거 매핑)
+                </CardTitle>
+                {response.cached && (
+                  <Badge className="bg-[#17B890]/25 text-[#17B890] border-none font-semibold text-[10px]">
+                    결과 캐싱됨
+                  </Badge>
+                )}
+              </CardHeader>
+              <CardContent className="p-5 space-y-4">
+                
+                {response.answer.startsWith("문서가 아직 인덱싱") && (
+                  <div className="rounded-lg border border-indigo-100 bg-indigo-50/30 p-4 space-y-2.5">
+                    <div className="flex items-center space-x-3">
+                      <Loader2 className="h-5 w-5 text-[#5146E5] animate-spin" />
+                      <div>
+                        <p className="text-xs font-bold text-slate-800">문서 청크 분해 중</p>
+                        <p className="text-[10px] text-slate-400">RAG 지식 인덱스가 완전히 구축되면 지식 응답 품질이 더욱 정밀해집니다.</p>
                       </div>
-                      <div className="text-sm text-muted-foreground">{stat.label}</div>
-                    </CardContent>
-                  </Card>
-                );
-              })}
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* Features Section */}
-      <section className="py-20 px-4 bg-muted/30">
-        <div className="container mx-auto">
-          <div className="text-center mb-16">
-            <h3 className="text-3xl md:text-4xl font-bold mb-4">
-              <span className="gradient-text">강력한 기능</span>으로 완성된
-            </h3>
-            <p className="text-xl text-muted-foreground max-w-2xl mx-auto">
-              최신 AI 기술과 직관적인 인터페이스로 문서 검색의 새로운 경험을 제공합니다.
-            </p>
-          </div>
-
-          <div className="grid md:grid-cols-2 lg:grid-cols-4 gap-6">
-            {features.map((feature, index) => {
-              const Icon = feature.icon;
-              return (
-                <Card key={index} className="text-center hover:shadow-xl transition-all duration-300 group">
-                  <CardHeader>
-                    <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-gradient-to-br from-primary to-primary-glow flex items-center justify-center group-hover:scale-110 transition-transform duration-300 ai-glow">
-                      <Icon className="w-8 h-8 text-white" />
                     </div>
-                    <CardTitle className="text-xl">{feature.title}</CardTitle>
+                  </div>
+                )}
+
+                <div className="prose prose-sm max-w-none text-slate-800 whitespace-pre-wrap text-sm leading-relaxed">
+                  {response.answer}
+                </div>
+                <p className="text-[10px] text-slate-400 border-t pt-3">
+                  ※ 본 답변은 적재된 원천 문서(PDF) 채널에서 파싱된 온톨로지 지식에 의거하여 생성되었습니다.
+                </p>
+
+                {/* Citations Box */}
+                {response.citations && response.citations.length > 0 && (
+                  <div className="mt-4 pt-4 border-t border-slate-100">
+                    <h4 className="text-xs font-bold text-slate-500 mb-3 flex items-center gap-1.5">
+                      <FileText className="w-4 h-4 text-slate-400" />
+                      참고 인용 문헌 및 스팬 (Citations)
+                    </h4>
+                    <div className="grid gap-2">
+                      {response.citations.map((cite, idx) => (
+                        <div key={idx} className="text-xs bg-slate-50 rounded-lg p-3 border border-slate-100/60 flex items-start gap-2.5">
+                          <span className="h-5 w-5 rounded bg-slate-200/60 flex items-center justify-center font-bold text-slate-600 shrink-0">
+                            {idx + 1}
+                          </span>
+                          <div className="space-y-1">
+                            <span className="font-bold text-[#5146E5] block">
+                              {cite.title || "지정되지 않은 문헌"}
+                            </span>
+                            <p className="text-slate-600 leading-normal text-[11px] font-medium bg-white p-2 rounded border border-slate-100">
+                              {cite.content || cite.snippet}
+                            </p>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </div>
+        ) : (
+          /* Recommended Knowledge list (Pre-search state) */
+          <div className="space-y-4">
+            <h3 className="text-sm font-bold text-slate-500 uppercase tracking-wider">주요 실사 추천 지식 (4칸 요약 기준)</h3>
+            <div className="grid grid-cols-1 gap-4">
+              {recommendedKnowledge.map((card, idx) => (
+                <Card key={idx} className="rounded-xl border border-slate-200/80 shadow-sm bg-white overflow-hidden">
+                  <CardHeader className="bg-slate-50/50 py-3 px-4 border-b border-slate-100">
+                    <CardTitle className="text-sm font-bold text-slate-800 flex items-center gap-2">
+                      <span className="w-1.5 h-3.5 bg-[#5146E5] rounded-full inline-block"></span>
+                      {card.title}
+                    </CardTitle>
                   </CardHeader>
-                  <CardContent>
-                    <CardDescription className="text-base">
-                      {feature.description}
-                    </CardDescription>
+                  <CardContent className="p-4">
+                    {/* 4-column summary format instead of generic charts */}
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs border border-slate-100 rounded-lg bg-slate-50/30 overflow-hidden divide-y md:divide-y-0 md:divide-x divide-slate-100">
+                      <div className="p-3">
+                        <span className="text-[10px] text-slate-400 font-bold block mb-0.5">현재 값 (Current)</span>
+                        <span className="font-bold text-slate-700">{card.current}</span>
+                      </div>
+                      <div className="p-3">
+                        <span className="text-[10px] text-slate-400 font-bold block mb-0.5">기준 값 (Reference)</span>
+                        <span className="font-bold text-slate-700">{card.target}</span>
+                      </div>
+                      <div className="p-3">
+                        <span className="text-[10px] text-slate-400 font-bold block mb-0.5">수치 차이 (Diff)</span>
+                        <span className="font-bold text-red-600">{card.diff}</span>
+                      </div>
+                      <div className="p-3">
+                        <span className="text-[10px] text-slate-400 font-bold block mb-0.5">진단 판단 (Verdict)</span>
+                        <span className="font-semibold text-slate-700 leading-normal block">{card.verdict}</span>
+                      </div>
+                    </div>
                   </CardContent>
                 </Card>
-              );
-            })}
-          </div>
-        </div>
-      </section>
-
-      {/* Technology Section */}
-      <section className="py-20 px-4">
-        <div className="container mx-auto">
-          <div className="max-w-4xl mx-auto">
-            <div className="text-center mb-16">
-              <h3 className="text-3xl md:text-4xl font-bold mb-4">
-                <span className="gradient-text">최첨단 기술</span> 스택
-              </h3>
-              <p className="text-xl text-muted-foreground">
-                검증된 AI 기술과 클라우드 인프라로 안정적이고 빠른 서비스를 제공합니다.
-              </p>
+              ))}
             </div>
+          </div>
+        )}
 
-            <div className="grid md:grid-cols-3 gap-8">
-              <Card className="text-center accent-glow">
-                <CardHeader>
-                  <div className="w-12 h-12 mx-auto mb-4 rounded-lg bg-gradient-to-br from-accent to-accent-glow flex items-center justify-center">
-                    <Brain className="w-6 h-6 text-white" />
+        {/* Quick Stats overview cards */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 pt-4">
+          {stats.map((stat, index) => {
+            const Icon = stat.icon;
+            return (
+              <Card
+                key={index}
+                role="button"
+                tabIndex={0}
+                onClick={() => setStatDetail(stat.kind)}
+                className="text-center rounded-xl border border-slate-200/80 cursor-pointer bg-white hover:shadow-md hover:border-[#5146E5]/40 transition-all p-4 outline-none"
+              >
+                <CardContent className="p-0 flex flex-col items-center">
+                  <div className="w-10 h-10 rounded-full bg-slate-50 flex items-center justify-center mb-2.5 border border-slate-100">
+                    <Icon className="w-5 h-5 text-[#5146E5]" />
                   </div>
-                  <CardTitle>Grok API</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <CardDescription>
-                    xAI의 최신 LLM으로 강력한 추론 능력과 실시간 웹 검색 기능을 제공합니다.
-                  </CardDescription>
+                  <div className="text-xl font-bold text-slate-800">{stat.value}</div>
+                  <div className="text-[11px] text-slate-400 font-bold mt-0.5">{stat.label}</div>
+                  <span className="text-[9px] text-[#5146E5] font-bold mt-2">상세 정보 →</span>
                 </CardContent>
               </Card>
-
-              <Card className="text-center accent-glow">
-                <CardHeader>
-                  <div className="w-12 h-12 mx-auto mb-4 rounded-lg bg-gradient-to-br from-accent to-accent-glow flex items-center justify-center">
-                    <FileText className="w-6 h-6 text-white" />
-                  </div>
-                  <CardTitle>Collections API</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <CardDescription>
-                    관리형 RAG 서비스로 복잡한 인프라 없이 문서 인덱싱과 검색을 자동화합니다.
-                  </CardDescription>
-                </CardContent>
-              </Card>
-
-              <Card className="text-center accent-glow">
-                <CardHeader>
-                  <div className="w-12 h-12 mx-auto mb-4 rounded-lg bg-gradient-to-br from-accent to-accent-glow flex items-center justify-center">
-                    <Zap className="w-6 h-6 text-white" />
-                  </div>
-                  <CardTitle>실시간 처리</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <CardDescription>
-                    빠른 임베딩 처리와 하이브리드 검색으로 2초 이내 응답 시간을 보장합니다.
-                  </CardDescription>
-                </CardContent>
-              </Card>
-            </div>
-          </div>
+            );
+          })}
         </div>
-      </section>
 
-      {/* CTA Section */}
-      <section className="py-20 px-4 bg-gradient-to-r from-primary to-primary-glow text-white">
-        <div className="container mx-auto text-center">
-          <h3 className="text-3xl md:text-4xl font-bold mb-6">
-            지금 바로 시작해보세요
-          </h3>
-          <p className="text-xl mb-8 opacity-90 max-w-2xl mx-auto">
-            문서를 업로드하고 AI의 도움으로 필요한 정보를 빠르게 찾아보세요.
-          </p>
-          <div className="flex flex-col sm:flex-row gap-4 justify-center">
-            <Button
-              size="lg"
-              variant="secondary"
-              className="bg-white text-primary hover:bg-white/90"
-              onClick={() => handleAuthAction(() => navigate("/upload"))}
-            >
-              <Upload className="w-5 h-5 mr-2" />
-              문서 업로드하기
-            </Button>
-            <Button
-              size="lg"
-              variant="outline"
-              className="border-white text-white hover:bg-white hover:text-primary"
-              onClick={() => navigate("/dashboard")}
-            >
-              <MessageSquare className="w-5 h-5 mr-2" />
-              데모 체험하기
-            </Button>
-          </div>
-        </div>
-      </section>
-
-      {/* Footer */}
-      <footer className="py-12 px-4 bg-muted/50">
-        <div className="container mx-auto">
-          <div className="flex flex-col md:flex-row items-center justify-between">
-            <div className="flex items-center space-x-3 mb-4 md:mb-0">
-              <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-primary to-primary-glow flex items-center justify-center">
-                <Brain className="w-5 h-5 text-white" />
-              </div>
-              <span className="text-lg font-semibold gradient-text">RAG Search</span>
-            </div>
-            <div className="flex items-center space-x-6 text-sm text-muted-foreground">
-              <span>© 2025 RAG Search</span>
-              <Badge variant="secondary">v1.0</Badge>
-            </div>
-          </div>
-        </div>
-      </footer>
-    </div>
+        <StatDetailDialog kind={statDetail} onClose={() => setStatDetail(null)} />
+      </div>
+    </SidebarLayout>
   );
 };
 

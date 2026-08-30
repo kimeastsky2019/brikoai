@@ -8,9 +8,13 @@ from __future__ import annotations
 
 import os
 import tempfile
+from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+import httpx
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
+
+from config import LLMWIKI_BASE_URL, LLMWIKI_PUBLIC_URL, LLMWIKI_TIMEOUT_SEC
 
 from . import taxonomy, compliance, ingest as kb_ingest, ontology
 
@@ -191,3 +195,162 @@ async def kb_health():
         "sectors": len(taxonomy.SECTOR_CODES),
         "channels": ["text", "table", "image", "excel"],
     }
+
+
+# --------------------------------------------------------------------------
+# LLM Wiki 연동 — 분석한 진단보고서를 위키(work.ets0404.com) 표준 문서로 저장
+# --------------------------------------------------------------------------
+@router.get("/wiki/status")
+async def kb_wiki_status():
+    """'위키에 저장' 버튼을 띄울지 화면이 판단할 근거."""
+    if not LLMWIKI_BASE_URL:
+        return {"enabled": False, "reason": "LLMWIKI_BASE_URL 미설정"}
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(f"{LLMWIKI_BASE_URL.rstrip('/')}/api/wiki/health")
+            r.raise_for_status()
+            h = r.json()
+        return {
+            "enabled":    True,
+            "public_url": LLMWIKI_PUBLIC_URL,
+            "contract":   h.get("contract"),
+            "pages":      (h.get("store") or {}).get("pages"),
+        }
+    except Exception as e:
+        return {"enabled": False, "reason": f"위키에 연결할 수 없습니다: {e}"}
+
+
+@router.post("/wiki/save")
+async def kb_wiki_save(
+    file: UploadFile = File(...),
+    # Form(...) 로 두면 값이 비었을 때 FastAPI 가 먼저 422 를 내보내, 아래의
+    # "사업장명을 입력하세요" 안내가 화면에 닿지 않는다. 기본값을 주고 직접 검증한다.
+    site: str = Form(""),
+    sector: str | None = Form(None),
+    owner: str = Form(""),
+):
+    """원본 PDF 를 LLM Wiki 의 /api/wiki/ingest 로 넘겨 표준 문서로 저장한다.
+
+    브라우저가 위키를 직접 부르지 않고 여기서 중계한다 — 위키는 nginx basic auth
+    뒤에 있고 교차 출처라, 직접 부르면 인증창이 뜨고 CORS 도 열어야 한다.
+    루프백으로 부르면 둘 다 피하면서 자격증명이 브라우저에 남지 않는다.
+
+    `site`(사업장 키)는 필수다. 이 값이 바뀌면 위키의 모든 stable_id 가 바뀌므로
+    위키 쪽 설계가 사람의 확정을 요구한다 — 여기서 임의로 채우지 않는다.
+    """
+    if not LLMWIKI_BASE_URL:
+        raise HTTPException(503, "위키 연동이 설정되지 않았습니다 (LLMWIKI_BASE_URL).")
+    site = (site or "").strip()
+    if not site:
+        raise HTTPException(400, "사업장명을 입력하세요 — 위키 문서 식별자의 기준이 됩니다.")
+
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in ALLOWED:
+        raise HTTPException(400, f"PDF 만 지원합니다 (받은 확장자: {ext or '없음'})")
+    content = await file.read()
+    if len(content) > MAX_PDF_BYTES:
+        raise HTTPException(413, f"파일이 너무 큽니다 ({len(content) // 1048576}MB > 50MB)")
+
+    data = {"site": site, "owner": owner or ""}
+    if sector:
+        data["sector"] = sector
+
+    try:
+        async with httpx.AsyncClient(timeout=LLMWIKI_TIMEOUT_SEC) as c:
+            r = await c.post(
+                f"{LLMWIKI_BASE_URL.rstrip('/')}/api/wiki/ingest",
+                files={"file": (file.filename, content, "application/pdf")},
+                data=data,
+            )
+    except httpx.TimeoutException:
+        raise HTTPException(504, "위키 적재가 시간 내에 끝나지 않았습니다. 위키에서 진행 상태를 확인하세요.")
+    except Exception as e:
+        raise HTTPException(502, f"위키에 연결하지 못했습니다: {e}")
+
+    if r.status_code >= 400:
+        raise HTTPException(r.status_code, f"위키가 거절했습니다: {r.text[:300]}")
+
+    out = r.json()
+    # 화면이 바로 쓸 수 있게 요약만 추려 준다 (analysis 전문은 이미 화면에 있다).
+    # 다만 게이트가 막았을 때는 '무엇 때문에 막혔는지' 가 없으면 사용자가 손쓸 수가
+    # 없다. 비식별 검산의 잔존 항목과 규제 위반 목록은 반드시 실어 보낸다.
+    wa = out.get("analysis") or {}
+    masking = wa.get("masking") or {}
+    compliance = wa.get("compliance") or {}
+    return {
+        "stored":     out.get("stored", False),
+        "skipped":    out.get("skipped"),
+        "pages":      out.get("pages", []),
+        "records":    out.get("records"),
+        "channels":   out.get("channels"),
+        "lint":       out.get("lint"),
+        "warnings":   out.get("warnings", []),
+        "checks_failed": out.get("checks_failed", []),
+        "gate": {
+            "allowed":        out.get("gate_allowed"),
+            "allowed_raw":    wa.get("upload_allowed_raw"),
+            "masked_count":   masking.get("masked_count"),
+            "residual_count": masking.get("residual_count"),
+            "residual":       masking.get("residual", [])[:10],
+            "findings":       (compliance.get("findings") or [])[:10],
+        },
+        "public_url": LLMWIKI_PUBLIC_URL,
+    }
+
+
+# --------------------------------------------------------------------------
+# 현장 체크리스트 — 위키의 /api/audit/* 를 그대로 중계한다.
+#
+# 항목은 위키에 쌓인 개선안(measure) 카드에서 나온다. 화면이 목록을 직접 들고
+# 있으면 진단이 쌓여도 점검표가 늘지 않는다 — 실제로 그렇게 하드코딩돼 있었다.
+# 위키를 브라우저가 직접 부르지 못하는 이유는 /kb/wiki/* 와 같다 (basic auth · CORS).
+# --------------------------------------------------------------------------
+def _wiki_url(path: str) -> str:
+    if not LLMWIKI_BASE_URL:
+        raise HTTPException(503, "위키 연동이 설정되지 않았습니다 (LLMWIKI_BASE_URL).")
+    return f"{LLMWIKI_BASE_URL.rstrip('/')}{path}"
+
+
+async def _wiki_call(method: str, path: str, **kw):
+    """위키로의 중계 호출. 실패 사유를 그대로 화면에 전달한다."""
+    try:
+        async with httpx.AsyncClient(timeout=120) as c:
+            r = await c.request(method, _wiki_url(path), **kw)
+    except httpx.TimeoutException:
+        raise HTTPException(504, "위키가 시간 내에 응답하지 않았습니다.")
+    except Exception as e:
+        raise HTTPException(502, f"위키에 연결하지 못했습니다: {e}")
+    if r.status_code >= 400:
+        raise HTTPException(r.status_code, f"위키가 거절했습니다: {r.text[:300]}")
+    return r.json()
+
+
+@router.get("/audit/checklist/draft")
+async def kb_checklist_draft(sector: str, lang: str = "ko"):
+    """업종을 고르면 위키의 개선안 카드로 설비별 초안을 만든다. 저장하지 않는다."""
+    return await _wiki_call(
+        "GET", "/api/audit/checklist/draft", params={"sector": sector, "lang": lang}
+    )
+
+
+@router.get("/audit/checklists")
+async def kb_checklists():
+    return await _wiki_call("GET", "/api/audit/checklists")
+
+
+@router.get("/audit/checklists/{cid}")
+async def kb_checklist(cid: str):
+    return await _wiki_call("GET", f"/api/audit/checklists/{quote(cid, safe='')}")
+
+
+@router.post("/audit/checklists")
+async def kb_save_checklist(payload: dict = Body(...)):
+    """저장은 위키가 한다 — 팀 전체가 같은 목록을 본다."""
+    if not str(payload.get("title") or "").strip():
+        raise HTTPException(400, "제목을 입력하세요.")
+    return await _wiki_call("POST", "/api/audit/checklists", json=payload)
+
+
+@router.delete("/audit/checklists/{cid}")
+async def kb_delete_checklist(cid: str):
+    return await _wiki_call("DELETE", f"/api/audit/checklists/{quote(cid, safe='')}")

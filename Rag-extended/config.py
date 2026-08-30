@@ -71,6 +71,25 @@ RRF_PREFETCH   = int(os.getenv("RRF_PREFETCH", "40"))   # 융합 전 각 경로�
 FILES_ROOT     = os.getenv("FILES_ROOT", "/opt/rag/data/files")
 
 # ──────────────────────────────────────────────
+# LLM Wiki 연동 (work.ets0404.com)
+#
+# 지식DB 화면의 '위키에 저장' 이 원본 PDF 를 위키의 /api/wiki/ingest 로 넘긴다.
+# 브라우저에서 직접 부르지 않고 서버가 중계하는 이유:
+#   - work.ets0404.com 은 nginx basic auth 뒤에 있어 브라우저가 인증창을 띄운다
+#   - 교차 출처라 CORS 를 따로 열어야 한다
+# 같은 호스트의 루프백으로 부르면 둘 다 우회하면서 자격증명도 브라우저에 안 남는다.
+# 비어 있으면 연동 기능이 꺼진다.
+# ──────────────────────────────────────────────
+# 서비스 간(rag-api ↔ llmwiki) 호출용 공유 토큰. 사용자 JWT 가 아니라 서버끼리
+# 쓰는 자격증명이라 별도로 둔다. 비어 있으면 내부 API 가 열리지 않는다.
+INTERNAL_API_TOKEN  = os.getenv("INTERNAL_API_TOKEN", "")
+
+LLMWIKI_BASE_URL    = os.getenv("LLMWIKI_BASE_URL", "")            # 예: http://127.0.0.1:8722
+LLMWIKI_PUBLIC_URL  = os.getenv("LLMWIKI_PUBLIC_URL", "")          # 예: https://work.ets0404.com
+# 위키 적재는 PDF 파싱 + LLM 서술 생성이라 수 분이 걸린다.
+LLMWIKI_TIMEOUT_SEC = float(os.getenv("LLMWIKI_TIMEOUT_SEC", "840"))
+
+# ──────────────────────────────────────────────
 # Cache (in-memory LRU)
 # ──────────────────────────────────────────────
 CACHE_TTL_SEC  = int(os.getenv("CACHE_TTL_SEC", "300"))

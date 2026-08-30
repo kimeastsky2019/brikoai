@@ -62,7 +62,37 @@ class IngestResult:
     def to_dict(self) -> dict:
         d = {k: v for k, v in self.__dict__.items() if k not in ("graph", "chunks")}
         d["has_graph"] = self.graph is not None
+        # 화면의 채널 카드(글/표/그림/엑셀) 숫자를 눌렀을 때 근거를 보여주려면
+        # 개수뿐 아니라 항목 자체가 필요하다. chunks 원본은 78면 문서 기준 수백 KB라
+        # 그대로 실으면 응답이 무거워지므로, 본문을 잘라낸 미리보기만 싣는다.
+        d["channel_items"] = _channel_preview(self.chunks)
         return d
+
+
+# 채널별 미리보기 상한 — 화면에서 확인하기에 충분하되 응답이 붓지 않는 선.
+_PREVIEW_MAX_ITEMS = 200
+_PREVIEW_MAX_CHARS = 800
+
+
+def _channel_preview(chunks: list[dict]) -> dict:
+    """4채널 청크를 화면 표시용으로 요약한다. 잘라낸 항목은 truncated=True 로 표시."""
+    out: dict[str, list[dict]] = {"text": [], "table": [], "image": []}
+    for c in chunks:
+        ch = c.get("channel")
+        if ch not in out or len(out[ch]) >= _PREVIEW_MAX_ITEMS:
+            continue
+        body = c.get("content", "") or ""
+        out[ch].append({
+            "page":      c.get("page"),
+            "anchor":    c.get("anchor"),        # p12/tbl3 — 원문 위치
+            "numeric":   c.get("n_numeric_cells"),   # 표 채널: 숫자셀 수
+            "chars":     len(body),
+            "preview":   body[:_PREVIEW_MAX_CHARS],
+            "truncated": len(body) > _PREVIEW_MAX_CHARS,
+        })
+    # '엑셀' 카드는 표 채널을 시트 단위로 다시 센 것이라 표와 같은 항목을 가리킨다.
+    out["excel"] = out["table"]
+    return out
 
 
 # 마스킹으로 해소되지 **않는** 위반. 값을 토큰으로 바꾸는 것만으로는

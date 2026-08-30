@@ -5,6 +5,8 @@ rag.py — Qdrant + BGE-M3 + LLM Router RAG 파이프라인
 [REPLACED] Grok Embeddings → BGE-M3 via Ollama
 [ADDED]    Circuit Breaker + 하이브리드 폴백 (Exo → Grok → Claude)
 """
+import asyncio
+import logging
 import time
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import (
@@ -23,6 +25,8 @@ from sparse import sparse_embed_query
 import contract
 # LLM은 직접 호출 대신 라우터 경유
 from llm_router import router as llm_router
+
+logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────
 # Singleton Qdrant client (앱 수명 주기 동안 재사용)
@@ -177,6 +181,42 @@ async def search_documents(
 # ──────────────────────────────────────────────
 # RAG Pipeline
 # ──────────────────────────────────────────────
+async def search_many(
+    collection_names: list[str],
+    query: str,
+    filters: dict | None = None,
+    top_k: int = TOP_K,
+    viewer_acl: str | None = None,
+) -> list[dict]:
+    """여러 컬렉션을 한 번에 검색해 점수 순으로 합친다.
+
+    보고서를 사업장별 컬렉션으로 나눈 뒤로 "화학 분야 보고서" 처럼 여러 사업장을
+    가로지르는 질문을 할 수가 없었다. 컬렉션을 하나 고르게 하는 대신, 전부 뒤져
+    점수로 줄 세운다.
+
+    컬렉션마다 top_k 를 받아 합친 뒤 다시 상위 top_k 만 남긴다 — 한 보고서가
+    상위를 독식하지 않게 하면서도 근거 개수는 단일 검색과 같게 유지한다.
+    """
+    tasks = [
+        search_documents(name, query, filters, top_k=top_k, viewer_acl=viewer_acl)
+        for name in collection_names
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    merged: list[dict] = []
+    for name, res in zip(collection_names, results):
+        # 컬렉션 하나가 죽어도 나머지 결과는 살린다 — 전부 실패해야 빈 손이다.
+        if isinstance(res, Exception):
+            logger.warning("컬렉션 검색 실패 %s: %s", name, res)
+            continue
+        for hit in res:
+            hit["collection"] = name
+            merged.append(hit)
+
+    merged.sort(key=lambda h: h.get("score", 0.0), reverse=True)
+    return merged[:top_k]
+
+
 async def run_rag(
     collection_name: str,
     query: str,
@@ -185,6 +225,7 @@ async def run_rag(
     collection_id: str | None = None,
     client=None,  # 무시 (Exo client는 내부 singleton)
     viewer_acl: str | None = None,
+    collection_names: list[str] | None = None,   # 주면 전체 검색
 ) -> dict:
     """
     RAG 3-step: embed → search → generate
@@ -201,7 +242,10 @@ async def run_rag(
     t0 = time.time()
 
     # 1. 검색 (ACL 게이트 포함)
-    chunks = await search_documents(collection_name, query, filters, viewer_acl=viewer_acl)
+    if collection_names:
+        chunks = await search_many(collection_names, query, filters, viewer_acl=viewer_acl)
+    else:
+        chunks = await search_documents(collection_name, query, filters, viewer_acl=viewer_acl)
 
     if not chunks:
         return {

@@ -415,6 +415,8 @@ class LLMRouter:
         for p in self.providers:
             st = p.cb.status()
             st["available"] = p.is_available()
+            # 화면이 "지금 어느 모델이 답하는가" 를 지어내지 않고 그대로 보여줄 수 있도록.
+            st["model"] = getattr(p, "model", None)
             providers_status[p.name] = st
             if p.is_available() and p.cb.can_attempt():
                 available_providers.append(p.name)
